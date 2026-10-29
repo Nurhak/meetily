@@ -255,7 +255,7 @@
             "failed"
           ],
           "x-extensible-enum": true,
-          "description": "skipped = the transcript was edited while transcribing, so the result was not saved."
+          "description": "skipped = the transcript was edited before or changed during transcription, so the result was not saved."
         },
         "transcriptionProgress": {
           "type": "number",

@@ -22,7 +22,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::identity::HubIdentity;
 use crate::netfilter::NetFilter;
 use crate::pairing::{Attempt, PairingInfo, PairingSession};
-use crate::probe::{AudioProber, BasicProber};
+use crate::probe::{AudioDetails, AudioProber, BasicProber};
 use crate::schema::Schemas;
 use crate::store::{default_hub_state, DeviceRecord, MeetingRow, Store, TranscriptRow, UploadRow};
 
@@ -32,8 +32,7 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const MAX_AUDIO_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_UPLOAD_CHUNK: usize = 16 * 1024 * 1024;
 const UPLOAD_TTL: chrono::Duration = chrono::Duration::hours(24);
-const TRASH_DAYS: i64 = 30;
-const TOMBSTONE_DAYS: i64 = 90;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone)]
 pub struct HubConfig {
@@ -48,6 +47,20 @@ pub struct HubConfig {
     pub listen: Vec<SocketAddr>,
     /// Advertise through DNS-SD.
     pub advertise: bool,
+    /// How long deleted meetings stay restorable (Recently deleted).
+    pub trash_retention: Duration,
+    /// How long tombstones stay in the change feed.
+    pub tombstone_retention: Duration,
+    /// Connections idle for this long are closed (longer than a 30-second long poll).
+    pub idle_timeout: Duration,
+    /// TLS handshake and request-header deadline.
+    pub handshake_timeout: Duration,
+    pub max_connections: usize,
+    pub max_connections_per_address: usize,
+    /// Unfinished uploads one device may have at a time.
+    pub max_unfinished_uploads_per_device: usize,
+    /// Free disk space the hub keeps after accepting an upload.
+    pub min_free_space: u64,
 }
 
 impl HubConfig {
@@ -67,6 +80,14 @@ impl HubConfig {
                 SocketAddr::from(([0u16; 8], DEFAULT_PORT)),
             ],
             advertise: true,
+            trash_retention: Duration::from_secs(30 * 24 * 3600),
+            tombstone_retention: Duration::from_secs(90 * 24 * 3600),
+            idle_timeout: Duration::from_secs(90),
+            handshake_timeout: Duration::from_secs(10),
+            max_connections: 128,
+            max_connections_per_address: 16,
+            max_unfinished_uploads_per_device: 4,
+            min_free_space: 1024 * 1024 * 1024,
         }
     }
 }
@@ -128,13 +149,10 @@ impl Caller {
         }
     }
 
-    fn owns(&self, recorded_by: &str, hub_id: &str) -> bool {
+    /// The desktop app manages every meeting it holds; a device owns what it (or a device it replaced) recorded.
+    fn owns(&self, recorded_by: &str) -> bool {
         match self {
-            // The desktop app manages every meeting it holds.
-            Caller::Hub => {
-                let _ = (recorded_by, hub_id);
-                true
-            }
+            Caller::Hub => true,
             Caller::Device(_) => self.identities().iter().any(|i| i == recorded_by),
         }
     }
@@ -199,21 +217,24 @@ pub struct AudioFile {
     pub size: u64,
 }
 
-/// Handed out by [`Hub::begin_transcription`].
+/// Handed out by [`Hub::begin_transcription`] and [`Hub::begin_retranscription`].
 #[derive(Debug, Clone)]
 pub struct TranscriptionTicket {
     pub meeting_id: String,
     /// Path of the audio to transcribe.
     pub audio_path: PathBuf,
     pub language_code: Option<String>,
+    /// Transcript revision when transcription began; any change after it means the user edited meanwhile.
     based_on_revision: Option<i64>,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum FinishOutcome {
     Saved,
-    /// The transcript was edited while transcribing, so the result was not saved.
+    /// The transcript changed while transcribing, so the result was not saved (the user's version stays).
     Skipped,
+    /// The meeting was deleted meanwhile; nothing was saved.
+    MeetingDeleted,
 }
 
 pub fn meeting_etag(revision: i64) -> String {
@@ -249,9 +270,16 @@ fn is_uuid(s: &str) -> bool {
         })
 }
 
-fn days_ago(days: i64) -> String {
-    (chrono::Utc::now() - chrono::Duration::days(days))
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+/// Upload IDs as the hub makes them; anything else is not looked up at all.
+pub fn is_upload_id(s: &str) -> bool {
+    (8..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn ago(d: Duration) -> String {
+    let d = chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX);
+    (chrono::Utc::now() - d).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn mime_for_extension(file_name: &str) -> Option<&'static str> {
@@ -275,6 +303,71 @@ const FILE_NAMES: &[&str] = &[
     "audio.mp3",
 ];
 
+fn transcription_state(row: &MeetingRow) -> &str {
+    row.hub_state
+        .get("transcription")
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+}
+
+/// Rejects transcripts other apps couldn't merge: duplicate segment or speaker IDs. Drops dangling speaker
+/// references and sorts segments (the order the format prescribes).
+fn tidy_transcript(doc: &mut Value) -> ApiResult<()> {
+    let mut speaker_ids = std::collections::HashSet::new();
+    for s in doc
+        .get("speakers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if !speaker_ids.insert(
+            s.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ) {
+            return Err(ApiError::bad_request("speaker ids must be unique"));
+        }
+    }
+    let Some(segments) = doc.get_mut("segments").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let mut segment_ids = std::collections::HashSet::new();
+    for seg in segments.iter_mut() {
+        if !segment_ids.insert(
+            seg.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ) {
+            return Err(ApiError::bad_request("segment ids must be unique"));
+        }
+        let dangling = seg
+            .get("speakerId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !speaker_ids.contains(id));
+        if dangling {
+            seg["speakerId"] = Value::Null;
+        }
+    }
+    let key = |s: &Value| {
+        (
+            s.get("startSec").and_then(Value::as_f64).unwrap_or(0.0),
+            s.get("endSec").and_then(Value::as_f64).unwrap_or(0.0),
+            s.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+    segments.sort_by(|a, b| {
+        key(a)
+            .partial_cmp(&key(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Hub {
     inner: Arc<Inner>,
@@ -284,11 +377,12 @@ struct Inner {
     config: HubConfig,
     identity: HubIdentity,
     store: Store,
-    schemas: Schemas,
+    schemas: Arc<Schemas>,
     pairing: StdMutex<Option<PairingSession>>,
     events: mpsc::UnboundedSender<HubEvent>,
     seq: watch::Sender<i64>,
     netfilter: NetFilter,
+    /// One lock per upload in progress; entries exist only for uploads in the database.
     upload_locks: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     prober: Arc<dyn AudioProber>,
     listening: RwLock<Vec<SocketAddr>>,
@@ -318,7 +412,7 @@ impl Hub {
                 config,
                 identity,
                 store,
-                schemas: Schemas::load()?,
+                schemas: Arc::new(Schemas::load()?),
                 pairing: StdMutex::new(None),
                 events,
                 seq: watch::Sender::new(current),
@@ -328,7 +422,25 @@ impl Hub {
                 listening: RwLock::new(Vec::new()),
             }),
         };
+        hub.recover_transcriptions().await?;
         Ok((hub, rx))
+    }
+
+    /// Transcription that was queued or running when the app quit starts again.
+    async fn recover_transcriptions(&self) -> anyhow::Result<()> {
+        let _g = self.store().lock().await;
+        for row in self
+            .store()
+            .meetings_in_transcription_state(&["queued", "running"])
+            .await?
+        {
+            let mut state = row.hub_state.clone();
+            state["transcription"] = json!("none");
+            state["transcriptionProgress"] = json!(0);
+            self.store().set_hub_state(&row.id, &state, false).await?;
+            self.maybe_queue_transcription(&row.id).await?;
+        }
+        Ok(())
     }
 
     pub fn hub_id(&self) -> &str {
@@ -363,7 +475,8 @@ impl Hub {
         let _ = self.inner.events.send(e);
     }
 
-    fn notify(&self, seq: i64) {
+    fn notify(&self, seq: Option<i64>) {
+        let Some(seq) = seq else { return };
         self.inner.seq.send_if_modified(|current| {
             if seq > *current {
                 *current = seq;
@@ -372,6 +485,21 @@ impl Hub {
                 false
             }
         });
+    }
+
+    async fn check_schema(&self, doc: Value, transcript: bool) -> ApiResult<Value> {
+        let schemas = self.inner.schemas.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = if transcript {
+                schemas.check_transcript(&doc)
+            } else {
+                schemas.check_meeting(&doc)
+            };
+            result.map(|_| doc)
+        })
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::bad_request)
     }
 
     // MARK: hello and pairing
@@ -428,8 +556,14 @@ impl Hub {
         *self.inner.pairing.lock().unwrap() = None;
     }
 
-    /// `POST /v1/pair`.
-    pub async fn pair(&self, peer: IpAddr, body: &Value) -> ApiResult<Value> {
+    /// `POST /v1/pair`. `presented_token`: the device's current token, required to pair a deviceId that is
+    /// already paired (otherwise anyone who completes a pairing could take over another phone's identity).
+    pub async fn pair(
+        &self,
+        peer: IpAddr,
+        body: &Value,
+        presented_token: Option<&str>,
+    ) -> ApiResult<Value> {
         let code = body
             .get("code")
             .and_then(Value::as_str)
@@ -470,7 +604,7 @@ impl Hub {
                 return Err(ApiError::pairing_code_invalid());
             };
             match session.attempt(peer, code) {
-                Attempt::Accepted => *guard = None,
+                Attempt::Accepted => {}
                 Attempt::AddressBlocked => {
                     return Err(ApiError::rate_limited(session.remaining().as_secs().max(1)))
                 }
@@ -482,8 +616,18 @@ impl Hub {
                 }
             }
         }
-        let token = random_token(32);
         let _g = self.store().lock().await;
+        if let Some(current) = self.store().device_token_hash(&device_id).await? {
+            if presented_token.map(token_hash).as_deref() != Some(current.as_str()) {
+                // The code stays valid: the right phone can still pair.
+                return Err(ApiError::forbidden(
+                    "this device is already paired: send its current token, or remove it on the computer first",
+                ));
+            }
+        }
+        // The code is used up only now.
+        *self.inner.pairing.lock().unwrap() = None;
+        let token = random_token(32);
         let record = self
             .store()
             .pair_device(
@@ -649,10 +793,7 @@ impl Hub {
         if docs::str_field(&body, "id") != Some(id.as_str()) {
             return Err(ApiError::bad_request("id in the body must match the path"));
         }
-        self.inner
-            .schemas
-            .check_meeting(&body)
-            .map_err(ApiError::bad_request)?;
+        let body = self.check_schema(body, false).await?;
         let caller_id = caller.device_id(self.hub_id());
         let now = docs::now();
 
@@ -697,15 +838,13 @@ impl Hub {
                 }
                 let revision = row.revision + 1;
                 stamp(&mut doc, revision, &now, &caller_id);
-                let declared = row.declared_audio.clone();
                 let updated = MeetingRow {
                     doc,
                     revision,
-                    declared_audio: declared,
                     ..row
                 };
-                let seq = self.store().save_meeting(&updated).await?;
-                self.after_meeting_saved(&updated.id, seq).await?;
+                let seq = self.store().save_meeting(&updated, None).await?;
+                self.after_meeting_saved(&id, seq).await?;
                 let saved = self.store().meeting(&id).await?.expect("just saved");
                 Ok(Write::Updated {
                     doc: Self::meeting_view(&saved),
@@ -718,12 +857,10 @@ impl Hub {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                if let Caller::Device(_) = caller {
-                    if recorded_by != caller_id {
-                        return Err(ApiError::forbidden(
-                            "recordedBy.deviceId must be the creating device",
-                        ));
-                    }
+                if matches!(caller, Caller::Device(_)) && recorded_by != caller_id {
+                    return Err(ApiError::forbidden(
+                        "recordedBy.deviceId must be the creating device",
+                    ));
                 }
                 let declared = body.get("audio").filter(|a| a.is_object()).cloned();
                 let mut doc = body;
@@ -741,7 +878,7 @@ impl Hub {
                     declared_audio: declared,
                     purged: false,
                 };
-                let seq = self.store().save_meeting(&row).await?;
+                let seq = self.store().save_meeting(&row, None).await?;
                 self.after_meeting_saved(&id, seq).await?;
                 let saved = self.store().meeting(&id).await?.expect("just saved");
                 Ok(Write::Created {
@@ -753,7 +890,7 @@ impl Hub {
     }
 
     async fn after_meeting_saved(&self, id: &str, seq: i64) -> anyhow::Result<()> {
-        self.notify(seq);
+        self.notify(Some(seq));
         self.emit(HubEvent::MeetingChanged {
             meeting_id: id.to_string(),
         });
@@ -769,7 +906,7 @@ impl Hub {
         if row.deleted_at.is_some() {
             return Ok(());
         }
-        if !caller.owns(&row.recorded_by, self.hub_id()) {
+        if !caller.owns(&row.recorded_by) {
             return Err(ApiError::forbidden(
                 "only the device that recorded a meeting can delete it everywhere",
             ));
@@ -785,8 +922,8 @@ impl Hub {
             deleted_at: Some(now),
             ..row
         };
-        let seq = self.store().save_meeting(&deleted).await?;
-        self.notify(seq);
+        let seq = self.store().save_meeting(&deleted, None).await?;
+        self.notify(Some(seq));
         self.emit(HubEvent::MeetingChanged { meeting_id: id });
         Ok(())
     }
@@ -796,10 +933,7 @@ impl Hub {
         let _g = self.store().lock().await;
         let row = self.store().meeting(id).await?.context("unknown meeting")?;
         anyhow::ensure!(row.deleted_at.is_some(), "the meeting isn't deleted");
-        anyhow::ensure!(
-            !row.purged,
-            "the meeting was deleted more than {TRASH_DAYS} days ago"
-        );
+        anyhow::ensure!(!row.purged, "the meeting is no longer in Recently deleted");
         let now = docs::now();
         let mut doc = row.doc.clone();
         docs::set(&mut doc, "deletedAt", Value::Null);
@@ -811,8 +945,8 @@ impl Hub {
             deleted_at: None,
             ..row
         };
-        let seq = self.store().save_meeting(&restored).await?;
-        self.notify(seq);
+        let seq = self.store().save_meeting(&restored, None).await?;
+        self.notify(Some(seq));
         self.emit(HubEvent::MeetingChanged {
             meeting_id: id.to_string(),
         });
@@ -858,10 +992,8 @@ impl Hub {
                 "meetingId in the body must match the path",
             ));
         }
-        self.inner
-            .schemas
-            .check_transcript(&body)
-            .map_err(ApiError::bad_request)?;
+        let mut body = self.check_schema(body, true).await?;
+        tidy_transcript(&mut body)?;
         let caller_id = caller.device_id(self.hub_id());
         let now = docs::now();
 
@@ -874,7 +1006,7 @@ impl Hub {
             return Err(ApiError::conflict("meeting_not_ended"));
         }
         let existing = self.store().transcript(&meeting_id).await?;
-        let write = match (pre, existing) {
+        let row = match (pre, existing) {
             (Precondition::Create, Some(t)) => {
                 return Ok(Write::Conflict {
                     doc: t.doc,
@@ -921,59 +1053,57 @@ impl Hub {
                 let generation = docs::str_field(&doc, "generation")
                     .unwrap_or_default()
                     .to_string();
-                let row = TranscriptRow {
+                TranscriptRow {
                     meeting_id: meeting_id.clone(),
                     doc,
                     revision,
                     generation,
-                };
-                self.store().save_transcript(&row).await?;
-                Write::Updated {
-                    doc: row.doc,
-                    etag: transcript_etag(revision),
                 }
             }
             (Precondition::Create, None) => {
+                // Phones make drafts; only the computer makes final transcripts.
+                if matches!(caller, Caller::Device(_))
+                    && docs::str_field(&body, "status") != Some("draft")
+                {
+                    return Err(ApiError::bad_request("transcripts from phones are drafts"));
+                }
                 let mut doc = body;
                 stamp(&mut doc, 1, &now, &caller_id);
                 let generation = docs::str_field(&doc, "generation")
                     .unwrap_or_default()
                     .to_string();
-                let row = TranscriptRow {
+                TranscriptRow {
                     meeting_id: meeting_id.clone(),
                     doc,
                     revision: 1,
                     generation,
-                };
-                self.store().save_transcript(&row).await?;
-                Write::Created {
-                    doc: row.doc,
-                    etag: transcript_etag(1),
                 }
             }
         };
-        let seq = self.store().touch_meeting(&meeting_id).await?;
-        self.notify(seq);
+        let seq = self.store().save_transcript(&row, None).await?;
+        self.notify(Some(seq));
         self.emit(HubEvent::TranscriptChanged {
             meeting_id: meeting_id.clone(),
         });
         self.maybe_queue_transcription(&meeting_id).await?;
-        Ok(write)
+        let etag = transcript_etag(row.revision);
+        Ok(if row.revision == 1 {
+            Write::Created { doc: row.doc, etag }
+        } else {
+            Write::Updated { doc: row.doc, etag }
+        })
     }
 
     // MARK: transcription hand-off
 
-    /// Queues transcription when the hub has the audio of an ended meeting and the transcript is missing or an
-    /// unedited draft (sync-protocol.md, "What the hub does with incoming meetings"). Call with the store locked.
+    /// Queues transcription when the hub has the audio of an ended meeting, nothing has been tried yet, and the
+    /// transcript is missing or an unedited draft (sync-protocol.md, "What the hub does with incoming meetings").
+    /// Failed, skipped or finished transcriptions are not retried automatically; the desktop app offers "Transcribe
+    /// again" ([`Hub::begin_retranscription`]). Call with the store locked.
     async fn maybe_queue_transcription(&self, meeting_id: &str) -> anyhow::Result<()> {
         let Some(row) = self.store().meeting(meeting_id).await? else {
             return Ok(());
         };
-        let state = row
-            .hub_state
-            .get("transcription")
-            .and_then(Value::as_str)
-            .unwrap_or("none");
         let audio = row
             .hub_state
             .get("audioReceived")
@@ -982,38 +1112,64 @@ impl Hub {
         if row.deleted_at.is_some()
             || !audio
             || docs::str_field(&row.doc, "status") != Some("ended")
-            || matches!(state, "queued" | "running")
+            || transcription_state(&row) != "none"
         {
             return Ok(());
         }
-        let wanted = match self.store().transcript(meeting_id).await? {
-            None => true,
-            Some(t) => {
-                docs::str_field(&t.doc, "status") == Some("draft") && !docs::has_edits(&t.doc)
-            }
-        };
-        if !wanted {
+        if !self.transcript_replaceable(meeting_id).await? {
             return Ok(());
         }
         let mut hub_state = row.hub_state.clone();
         hub_state["transcription"] = json!("queued");
         hub_state["transcriptionProgress"] = json!(0);
         hub_state["transcriptionError"] = Value::Null;
-        self.store()
+        let seq = self
+            .store()
             .set_hub_state(meeting_id, &hub_state, true)
             .await?;
-        self.notify(self.store().current_seq().await?);
+        self.notify(seq);
         self.emit(HubEvent::TranscriptionWanted {
             meeting_id: meeting_id.to_string(),
         });
         Ok(())
     }
 
-    /// Marks transcription as running and returns what to transcribe. Also used for "Transcribe again".
+    /// Missing, or a draft nobody edited.
+    async fn transcript_replaceable(&self, meeting_id: &str) -> anyhow::Result<bool> {
+        Ok(match self.store().transcript(meeting_id).await? {
+            None => true,
+            Some(t) => {
+                docs::str_field(&t.doc, "status") == Some("draft") && !docs::has_edits(&t.doc)
+            }
+        })
+    }
+
+    /// Starts the automatic transcription that [`HubEvent::TranscriptionWanted`] asked for. Returns `None` (and marks
+    /// the meeting `skipped`) when the transcript was edited since it was queued: edits are never replaced
+    /// automatically.
     pub async fn begin_transcription(
         &self,
         meeting_id: &str,
+    ) -> anyhow::Result<Option<TranscriptionTicket>> {
+        self.begin(meeting_id, false).await
+    }
+
+    /// "Transcribe again", which the user chose knowing their edits will be replaced.
+    pub async fn begin_retranscription(
+        &self,
+        meeting_id: &str,
     ) -> anyhow::Result<TranscriptionTicket> {
+        Ok(self
+            .begin(meeting_id, true)
+            .await?
+            .expect("forced transcription always starts"))
+    }
+
+    async fn begin(
+        &self,
+        meeting_id: &str,
+        forced: bool,
+    ) -> anyhow::Result<Option<TranscriptionTicket>> {
         let _g = self.store().lock().await;
         let row = self
             .store()
@@ -1027,6 +1183,11 @@ impl Hub {
             .and_then(Value::as_str)
             .context("the meeting has no audio")?;
         let audio_path = self.store().audio_dir(meeting_id).join(file);
+        if !forced && !self.transcript_replaceable(meeting_id).await? {
+            self.update_hub_state(&row, |s| s["transcription"] = json!("skipped"), true)
+                .await?;
+            return Ok(None);
+        }
         let based_on_revision = self
             .store()
             .transcript(meeting_id)
@@ -1042,12 +1203,12 @@ impl Hub {
             true,
         )
         .await?;
-        Ok(TranscriptionTicket {
+        Ok(Some(TranscriptionTicket {
             meeting_id: meeting_id.to_string(),
             audio_path,
             language_code: docs::str_field(&row.doc, "languageCode").map(str::to_string),
             based_on_revision,
-        })
+        }))
     }
 
     /// Progress for phones that poll `GET /v1/meetings/{id}`; no change-feed entry.
@@ -1077,9 +1238,13 @@ impl Hub {
             .meeting(meeting_id)
             .await?
             .context("unknown meeting")?;
+        self.mark_failed(&row, error).await
+    }
+
+    async fn mark_failed(&self, row: &MeetingRow, error: &str) -> anyhow::Result<()> {
         let error: String = error.chars().take(1000).collect();
         self.update_hub_state(
-            &row,
+            row,
             |s| {
                 s["transcription"] = json!("failed");
                 s["transcriptionError"] = json!(error);
@@ -1089,9 +1254,9 @@ impl Hub {
         .await
     }
 
-    /// Saves the hub's final transcript, unless a user edited the transcript since [`Hub::begin_transcription`].
-    /// `doc` is a complete transcript.json; the hub fills in meetingId, a new generation if needed, revision and
-    /// the update fields.
+    /// Saves the hub's final transcript, unless the transcript changed since transcription began (the user's
+    /// version then stays). `doc` is a complete transcript.json; the hub fills in meetingId, a new generation,
+    /// revision and the update fields. An invalid `doc` marks the transcription `failed`.
     pub async fn finish_transcription(
         &self,
         ticket: TranscriptionTicket,
@@ -1103,20 +1268,21 @@ impl Hub {
             .meeting(&ticket.meeting_id)
             .await?
             .context("unknown meeting")?;
+        if row.deleted_at.is_some() {
+            return Ok(FinishOutcome::MeetingDeleted);
+        }
         let current = self.store().transcript(&ticket.meeting_id).await?;
-        if let Some(t) = &current {
-            if Some(t.revision) != ticket.based_on_revision && docs::has_edits(&t.doc) {
-                self.update_hub_state(
-                    &row,
-                    |s| {
-                        s["transcription"] = json!("skipped");
-                        s["transcriptionProgress"] = json!(1);
-                    },
-                    true,
-                )
-                .await?;
-                return Ok(FinishOutcome::Skipped);
-            }
+        if current.as_ref().map(|t| t.revision) != ticket.based_on_revision {
+            self.update_hub_state(
+                &row,
+                |s| {
+                    s["transcription"] = json!("skipped");
+                    s["transcriptionProgress"] = json!(1);
+                },
+                true,
+            )
+            .await?;
+            return Ok(FinishOutcome::Skipped);
         }
         docs::lowercase_transcript_ids(&mut doc);
         docs::set(&mut doc, "formatVersion", json!(FORMAT_VERSION));
@@ -1130,28 +1296,34 @@ impl Hub {
         docs::set(&mut doc, "generation", json!(generation));
         let revision = current.as_ref().map(|t| t.revision + 1).unwrap_or(1);
         stamp(&mut doc, revision, &docs::now(), self.hub_id());
-        self.inner
-            .schemas
-            .check_transcript(&doc)
-            .map_err(|e| anyhow::anyhow!("invalid transcript: {e}"))?;
-        self.store()
-            .save_transcript(&TranscriptRow {
-                meeting_id: ticket.meeting_id.clone(),
-                doc,
-                revision,
-                generation,
-            })
-            .await?;
-        self.update_hub_state(
-            &row,
-            |s| {
-                s["transcription"] = json!("done");
-                s["transcriptionProgress"] = json!(1);
-                s["transcriptionError"] = Value::Null;
+        let checked = match self.check_schema(doc, true).await {
+            Ok(mut d) => match tidy_transcript(&mut d) {
+                Ok(()) => Ok(d),
+                Err(e) => Err(e),
             },
-            true,
-        )
-        .await?;
+            Err(e) => Err(e),
+        };
+        let doc = match checked {
+            Ok(d) => d,
+            Err(e) => {
+                let message = e.detail.clone().unwrap_or_else(|| e.code.to_string());
+                self.mark_failed(&row, &format!("invalid transcript: {message}"))
+                    .await?;
+                anyhow::bail!("invalid transcript: {message}");
+            }
+        };
+        let mut state = row.hub_state.clone();
+        state["transcription"] = json!("done");
+        state["transcriptionProgress"] = json!(1);
+        state["transcriptionError"] = Value::Null;
+        let row = TranscriptRow {
+            meeting_id: ticket.meeting_id.clone(),
+            doc,
+            revision,
+            generation,
+        };
+        let seq = self.store().save_transcript(&row, Some(&state)).await?;
+        self.notify(Some(seq));
         self.emit(HubEvent::TranscriptChanged {
             meeting_id: ticket.meeting_id,
         });
@@ -1166,10 +1338,8 @@ impl Hub {
     ) -> anyhow::Result<()> {
         let mut state = row.hub_state.clone();
         change(&mut state);
-        self.store().set_hub_state(&row.id, &state, bump).await?;
-        if bump {
-            self.notify(self.store().current_seq().await?);
-        }
+        let seq = self.store().set_hub_state(&row.id, &state, bump).await?;
+        self.notify(seq);
         Ok(())
     }
 
@@ -1211,7 +1381,9 @@ impl Hub {
             {
                 return Err(ApiError::payload_too_large());
             }
-            return Err(ApiError::bad_request("fileName, mimeType, sizeBytes (1 B to 4 GiB) and sha256 (lowercase hex) are required"));
+            return Err(ApiError::bad_request(
+                "fileName, mimeType, sizeBytes (1 B to 4 GiB) and sha256 (lowercase hex) are required",
+            ));
         };
         if mime_for_extension(file_name) != Some(mime) {
             return Err(ApiError::bad_request("mimeType doesn't match fileName"));
@@ -1222,7 +1394,7 @@ impl Hub {
         if meeting.deleted_at.is_some() {
             return Err(ApiError::meeting_deleted());
         }
-        if !caller.owns(&meeting.recorded_by, self.hub_id()) {
+        if !caller.owns(&meeting.recorded_by) {
             return Err(ApiError::forbidden(
                 "only the device that recorded a meeting uploads its audio",
             ));
@@ -1244,15 +1416,36 @@ impl Hub {
                 })
                 .unwrap_or_default()
         };
-        if let Some(u) = self
+        // One unfinished upload per meeting and device: a different file replaces the earlier attempt.
+        for u in self
             .store()
-            .unfinished_upload(&meeting_id, sha, &device.device_id)
+            .unfinished_uploads(&device.device_id, Some(&meeting_id))
             .await?
         {
-            return Ok((
-                StatusCode::OK,
-                json!({ "complete": false, "uploadId": u.id, "offset": u.offset, "expiresAt": expires(&u) }),
-            ));
+            if u.sha256 == sha && u.size_bytes == size && u.file_name == file_name {
+                return Ok((
+                    StatusCode::OK,
+                    json!({ "complete": false, "uploadId": u.id, "offset": u.offset, "expiresAt": expires(&u) }),
+                ));
+            }
+            self.discard_upload(&u.id).await?;
+        }
+        let limit = self.inner.config.max_unfinished_uploads_per_device;
+        if self
+            .store()
+            .unfinished_uploads(&device.device_id, None)
+            .await?
+            .len()
+            >= limit
+        {
+            return Err(ApiError::rate_limited(60)
+                .detail(format!("at most {limit} unfinished uploads per device")));
+        }
+        let free = fs4::available_space(&self.inner.config.data_dir).unwrap_or(u64::MAX);
+        if free < size as u64 + self.inner.config.min_free_space {
+            return Err(
+                ApiError::payload_too_large().detail("not enough free disk space on the computer")
+            );
         }
         let upload = UploadRow {
             id: random_token(18),
@@ -1275,6 +1468,9 @@ impl Hub {
     }
 
     async fn caller_upload(&self, caller: &Caller, upload_id: &str) -> ApiResult<UploadRow> {
+        if !is_upload_id(upload_id) {
+            return Err(ApiError::not_found());
+        }
         let upload = self
             .store()
             .upload(upload_id)
@@ -1309,6 +1505,16 @@ impl Hub {
             .clone()
     }
 
+    fn forget_upload_lock(&self, upload_id: &str) {
+        self.inner.upload_locks.lock().unwrap().remove(upload_id);
+    }
+
+    async fn discard_upload(&self, upload_id: &str) -> anyhow::Result<()> {
+        self.store().delete_upload(upload_id).await?;
+        self.forget_upload_lock(upload_id);
+        Ok(())
+    }
+
     /// `PATCH /v1/uploads/{id}`: one request per upload at a time; offsets count durably written bytes.
     pub async fn append_upload(
         &self,
@@ -1317,8 +1523,11 @@ impl Hub {
         offset: i64,
         bytes: &[u8],
     ) -> ApiResult<UploadProgress> {
+        // Only uploads that exist get a lock (unknown IDs must not grow the lock map).
+        self.caller_upload(caller, upload_id).await?;
         let lock = self.upload_lock(upload_id);
         let _upload_guard = lock.lock().await;
+        // Look again: it may have completed, expired or been replaced while waiting.
         let mut upload = self.caller_upload(caller, upload_id).await?;
         let mismatch = |at: i64| {
             ApiError::conflict("upload_offset_mismatch")
@@ -1341,15 +1550,24 @@ impl Hub {
             return Err(ApiError::payload_too_large().detail("more bytes than sizeBytes"));
         }
         let path = self.store().upload_path(upload_id);
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .await?;
-        file.set_len(offset as u64).await?;
-        file.seek(std::io::SeekFrom::Start(offset as u64)).await?;
-        file.write_all(bytes).await?;
-        file.sync_data().await?;
-        drop(file);
+        if !bytes.is_empty() {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .await?;
+            if file.metadata().await?.len() < offset as u64 {
+                // The partial file was lost (e.g. disk cleanup): start the upload again.
+                drop(file);
+                self.discard_upload(upload_id).await?;
+                return Err(ApiError::not_found().detail("the upload was lost; start a new one"));
+            }
+            file.set_len(offset as u64).await?;
+            file.seek(std::io::SeekFrom::Start(offset as u64)).await?;
+            file.write_all(bytes).await?;
+            file.sync_data().await?;
+        }
         upload.offset = offset + bytes.len() as i64;
         upload.updated_at = docs::now();
 
@@ -1360,36 +1578,79 @@ impl Hub {
                 complete: false,
             });
         }
-        let digest = sha256_file(&path).await?;
+        // The last byte arrived. Check it, then attach; failures that a retry can't fix end the upload.
+        let target = self
+            .store()
+            .audio_dir(&upload.meeting_id)
+            .join(&upload.file_name);
+        let source = if path.exists() {
+            path.clone()
+        } else {
+            target.clone()
+        };
+        let digest = match sha256_file(&source).await {
+            Ok(d) => d,
+            Err(_) => {
+                self.discard_upload(upload_id).await?;
+                return Err(ApiError::not_found().detail("the upload was lost; start a new one"));
+            }
+        };
         if digest != upload.sha256 {
-            self.store().delete_upload(upload_id).await?;
+            self.discard_upload(upload_id).await?;
             return Err(ApiError::checksum_mismatch().detail(format!(
                 "received {} bytes with SHA-256 {digest}, expected {}",
                 upload.size_bytes, upload.sha256
             )));
         }
-        let Caller::Device(device) = caller else {
-            unreachable!("uploads belong to devices")
-        };
-        let device_id = device.device_id.clone();
-        self.attach_audio(
-            &upload.meeting_id,
-            &path,
-            &upload.file_name,
-            &upload.mime_type,
-            &upload.sha256,
-            &device_id,
-        )
-        .await?;
+        let device_id = caller.device_id(self.hub_id());
         upload.complete = true;
-        self.store().save_upload(&upload).await?;
-        Ok(UploadProgress {
-            offset: upload.offset,
-            complete: true,
-        })
+        match self
+            .attach_audio(
+                &upload.meeting_id,
+                &source,
+                &upload.file_name,
+                &upload.mime_type,
+                &upload.sha256,
+                &device_id,
+                Some(&upload),
+            )
+            .await
+        {
+            Ok(()) => {
+                self.forget_upload_lock(upload_id);
+                Ok(UploadProgress {
+                    offset: upload.offset,
+                    complete: true,
+                })
+            }
+            Err(e) if e.status.is_client_error() => {
+                self.discard_upload(upload_id).await?;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Moves a verified file into the meeting and records it in meeting.json → `audio`.
+    async fn probe(&self, path: &Path, mime: &str) -> Option<AudioDetails> {
+        let prober = self.inner.prober.clone();
+        let (path, mime) = (path.to_path_buf(), mime.to_string());
+        let job = tokio::task::spawn_blocking(move || prober.probe(&path, &mime));
+        match tokio::time::timeout(PROBE_TIMEOUT, job).await {
+            Ok(Ok(Ok(details))) => Some(details),
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(target: "sync_hub", "couldn't read audio details: {e:#}");
+                None
+            }
+            _ => {
+                tracing::warn!(target: "sync_hub", "reading audio details took too long");
+                None
+            }
+        }
+    }
+
+    /// Moves a verified file into the meeting and records it in meeting.json → `audio` (and the upload as complete,
+    /// in the same transaction). Slow work (probing) happens before taking the store lock.
+    #[allow(clippy::too_many_arguments)]
     async fn attach_audio(
         &self,
         meeting_id: &str,
@@ -1398,7 +1659,11 @@ impl Hub {
         mime: &str,
         sha256: &str,
         updated_by: &str,
+        upload: Option<&UploadRow>,
     ) -> ApiResult<()> {
+        let probed = self.probe(source, mime).await;
+        let size = tokio::fs::metadata(source).await?.len();
+
         let _g = self.store().lock().await;
         let row = self
             .store()
@@ -1412,22 +1677,18 @@ impl Hub {
             if existing.get("sha256").and_then(Value::as_str) != Some(sha256) {
                 return Err(ApiError::conflict("audio_exists"));
             }
+            if let Some(u) = upload {
+                self.store().save_upload(u).await?;
+            }
             return Ok(());
         }
         let dir = self.store().audio_dir(meeting_id);
         tokio::fs::create_dir_all(&dir).await?;
         let target = dir.join(file_name);
-        if tokio::fs::rename(source, &target).await.is_err() {
-            tokio::fs::copy(source, &target).await?;
-            let _ = tokio::fs::remove_file(source).await;
+        if source != target {
+            // Same volume (uploads/ and audio/ share the data directory), so this is a rename.
+            tokio::fs::rename(source, &target).await?;
         }
-        let size = tokio::fs::metadata(&target).await?.len();
-        let prober = self.inner.prober.clone();
-        let (probe_path, probe_mime) = (target.clone(), mime.to_string());
-        let probed = tokio::task::spawn_blocking(move || prober.probe(&probe_path, &probe_mime))
-            .await
-            .ok()
-            .and_then(Result::ok);
         let declared = row.declared_audio.clone().unwrap_or(Value::Null);
         let mut audio = json!({
             "fileName": file_name,
@@ -1453,7 +1714,7 @@ impl Hub {
             .and_then(|p| p.channels)
             .map(i64::from)
             .or_else(|| declared.get("channels").and_then(Value::as_i64));
-        if let Some(c) = codec {
+        if let Some(c) = codec.filter(|c| !c.is_empty() && c.len() <= 32) {
             audio["codec"] = json!(c);
         }
         if let Some(r) = rate.filter(|r| *r >= 8000) {
@@ -1474,8 +1735,16 @@ impl Hub {
             hub_state,
             ..row
         };
-        let seq = self.store().save_meeting(&updated).await?;
-        self.notify(seq);
+        let seq = match self.store().save_meeting(&updated, upload).await {
+            Ok(seq) => seq,
+            Err(e) => {
+                if source != target {
+                    let _ = tokio::fs::rename(&target, source).await;
+                }
+                return Err(e.into());
+            }
+        };
+        self.notify(Some(seq));
         self.emit(HubEvent::AudioReceived {
             meeting_id: meeting_id.to_string(),
             path: target,
@@ -1503,7 +1772,8 @@ impl Hub {
         let file = audio
             .get("fileName")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .filter(|f| FILE_NAMES.contains(f))
+            .ok_or_else(ApiError::not_found)?;
         let path = self.store().audio_dir(&row.id).join(file);
         let size = tokio::fs::metadata(&path)
             .await
@@ -1527,7 +1797,9 @@ impl Hub {
 
     // MARK: change feed
 
-    /// `GET /v1/changes`.
+    /// `GET /v1/changes`. Cursors are opaque to phones: a number for incremental syncs, and `f<last>.<start>` while
+    /// paging through a full sync (which lists only meetings that aren't deleted and never expires mid-way). The last
+    /// page of a full sync returns the sequence number from when it started, so changes made during it come again.
     pub async fn changes(
         &self,
         caller: &Caller,
@@ -1535,13 +1807,28 @@ impl Hub {
         limit: Option<i64>,
         wait: Option<u64>,
     ) -> ApiResult<Value> {
-        let since = match since {
-            None => None,
-            Some(s) => Some(
+        enum Mode {
+            Full { after: i64, started: Option<i64> },
+            Incremental(i64),
+        }
+        let invalid = || ApiError::bad_request("invalid cursor");
+        let mode = match since {
+            None => Mode::Full {
+                after: 0,
+                started: None,
+            },
+            Some(s) if s.starts_with('f') => {
+                let (after, started) = s[1..].split_once('.').ok_or_else(invalid)?;
+                Mode::Full {
+                    after: after.parse().map_err(|_| invalid())?,
+                    started: Some(started.parse().map_err(|_| invalid())?),
+                }
+            }
+            Some(s) => Mode::Incremental(
                 s.parse::<i64>()
                     .ok()
                     .filter(|v| *v >= 0)
-                    .ok_or_else(|| ApiError::bad_request("invalid cursor"))?,
+                    .ok_or_else(invalid)?,
             ),
         };
         let limit = limit.unwrap_or(100);
@@ -1552,7 +1839,7 @@ impl Hub {
         if wait > 30 {
             return Err(ApiError::bad_request("wait must be 0 to 30"));
         }
-        if let Some(s) = since {
+        if let Mode::Incremental(s) = mode {
             if s < self.store().pruned_through().await? {
                 return Err(ApiError::cursor_expired());
             }
@@ -1561,17 +1848,18 @@ impl Hub {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
         let mut seq_rx = self.inner.seq.subscribe();
         loop {
-            let (snapshot, rows) = {
-                // Under the write lock, a change's sequence number and its row are always seen together.
-                let _g = self.store().lock().await;
-                let snapshot = self.store().current_seq().await?;
-                let rows = self
-                    .store()
-                    .changes(since, limit + 1, filter.as_deref())
-                    .await?;
-                (snapshot, rows)
+            let (after, live_only) = match mode {
+                Mode::Full { after, .. } => (after, true),
+                Mode::Incremental(s) => (s, false),
             };
-            if rows.is_empty() && since.is_some() && tokio::time::Instant::now() < deadline {
+            let (snapshot, rows) = self
+                .store()
+                .changes(after, live_only, limit + 1, filter.as_deref())
+                .await?;
+            if rows.is_empty()
+                && matches!(mode, Mode::Incremental(_))
+                && tokio::time::Instant::now() < deadline
+            {
                 // Long polling: wait for the next change (or the deadline), then look again.
                 let _ = tokio::time::timeout_at(deadline, seq_rx.changed()).await;
                 seq_rx.borrow_and_update();
@@ -1579,10 +1867,18 @@ impl Hub {
             }
             let has_more = rows.len() as i64 > limit;
             let page: Vec<MeetingRow> = rows.into_iter().take(limit as usize).collect();
-            let cursor = if has_more {
-                page.last().map(|r| r.seq).unwrap_or(snapshot)
-            } else {
-                snapshot
+            let last = page.last().map(|r| r.seq);
+            let cursor = match mode {
+                Mode::Incremental(_) if has_more => last.unwrap_or(snapshot).to_string(),
+                Mode::Incremental(_) => snapshot.to_string(),
+                Mode::Full { started, .. } => {
+                    let started = started.unwrap_or(snapshot);
+                    if has_more {
+                        format!("f{}.{started}", last.unwrap_or(0))
+                    } else {
+                        started.to_string()
+                    }
+                }
             };
             let ids: Vec<String> = page
                 .iter()
@@ -1594,23 +1890,27 @@ impl Hub {
                 .iter()
                 .map(|r| {
                     let deleted = r.deleted_at.is_some();
+                    let transcript_etag = match (deleted, transcripts.get(&r.id)) {
+                        (false, Some(rev)) => json!(transcript_etag(*rev)),
+                        _ => Value::Null,
+                    };
+                    let audio = match (deleted, r.doc.get("audio").filter(|a| a.is_object())) {
+                        (false, Some(a)) => {
+                            json!({ "sha256": a["sha256"], "sizeBytes": a["sizeBytes"] })
+                        }
+                        _ => Value::Null,
+                    };
                     json!({
                         "meetingId": r.id,
                         "deleted": deleted,
                         "meetingEtag": meeting_etag(r.revision),
-                        "transcriptEtag": if deleted { Value::Null } else { transcripts.get(&r.id).map(|rev| json!(transcript_etag(*rev))).unwrap_or(Value::Null) },
-                        "audio": if deleted { Value::Null } else {
-                            r.doc.get("audio").filter(|a| a.is_object())
-                                .map(|a| json!({ "sha256": a["sha256"], "sizeBytes": a["sizeBytes"] }))
-                                .unwrap_or(Value::Null)
-                        },
+                        "transcriptEtag": transcript_etag,
+                        "audio": audio,
                         "hubState": r.hub_state,
                     })
                 })
                 .collect();
-            return Ok(
-                json!({ "changes": changes, "cursor": cursor.to_string(), "hasMore": has_more }),
-            );
+            return Ok(json!({ "changes": changes, "cursor": cursor, "hasMore": has_more }));
         }
     }
 
@@ -1669,6 +1969,7 @@ impl Hub {
                 mime,
                 &sha,
                 self.hub_id(),
+                None,
             )
             .await;
         let _ = tokio::fs::remove_file(&staging).await;
@@ -1718,32 +2019,39 @@ impl Hub {
 
     // MARK: maintenance
 
-    /// Empties Recently deleted after 30 days, forgets tombstones after 90, expires idle uploads after 24 hours.
+    /// Empties Recently deleted, forgets old tombstones, and expires uploads idle for 24 hours.
     pub async fn run_maintenance(&self) -> anyhow::Result<()> {
-        let _g = self.store().lock().await;
-        for m in self
-            .store()
-            .meetings_deleted_before(&days_ago(TOMBSTONE_DAYS))
-            .await?
+        let config = &self.inner.config;
         {
-            let _ = tokio::fs::remove_dir_all(self.store().audio_dir(&m.id)).await;
-            self.store().forget_meeting(&m).await?;
-        }
-        for m in self
-            .store()
-            .meetings_deleted_before(&days_ago(TRASH_DAYS))
-            .await?
-        {
-            if !m.purged {
+            let _g = self.store().lock().await;
+            for m in self
+                .store()
+                .meetings_deleted_before(&ago(config.tombstone_retention))
+                .await?
+            {
                 let _ = tokio::fs::remove_dir_all(self.store().audio_dir(&m.id)).await;
-                self.store().mark_purged(&m.id).await?;
+                self.store().forget_meeting(&m).await?;
+            }
+            for m in self
+                .store()
+                .meetings_deleted_before(&ago(config.trash_retention))
+                .await?
+            {
+                if !m.purged {
+                    let _ = tokio::fs::remove_dir_all(self.store().audio_dir(&m.id)).await;
+                    self.store().mark_purged(&m.id).await?;
+                }
             }
         }
         let cutoff =
             (chrono::Utc::now() - UPLOAD_TTL).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         for u in self.store().uploads_idle_since(&cutoff).await? {
-            self.store().delete_upload(&u.id).await?;
-            self.inner.upload_locks.lock().unwrap().remove(&u.id);
+            // Skip uploads a request is working on right now.
+            let lock = self.upload_lock(&u.id);
+            let Ok(_guard) = lock.try_lock() else {
+                continue;
+            };
+            self.discard_upload(&u.id).await?;
         }
         Ok(())
     }

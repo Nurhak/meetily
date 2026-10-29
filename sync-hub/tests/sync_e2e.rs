@@ -528,7 +528,12 @@ async fn resumable_upload_download_and_final_transcript() {
     );
 
     // The desktop app transcribes and saves the final transcript.
-    let ticket = hub.hub.begin_transcription(&id).await.unwrap();
+    let ticket = hub
+        .hub
+        .begin_transcription(&id)
+        .await
+        .unwrap()
+        .expect("transcription starts");
     assert!(ticket.audio_path.ends_with("audio.wav"));
     assert_eq!(ticket.language_code.as_deref(), Some("nl"));
     hub.hub.set_transcription_progress(&id, 0.5).await.unwrap();
@@ -613,7 +618,12 @@ async fn edits_are_never_replaced_by_the_computer() {
     phone
         .upload(&id, "audio.wav", "audio/wav", &wav(1.0), 1 << 20)
         .await;
-    let ticket = hub.hub.begin_transcription(&id).await.unwrap();
+    let ticket = hub
+        .hub
+        .begin_transcription(&id)
+        .await
+        .unwrap()
+        .expect("transcription starts");
     draft["segments"][0]["text"] = json!("Goedemiddag allemaal.");
     draft["segments"][0]["edited"] = json!(true);
     assert_eq!(
@@ -960,7 +970,12 @@ async fn desktop_meetings_reach_the_phone() {
         hub.saw(|e| matches!(e, HubEvent::TranscriptionWanted { meeting_id } if *meeting_id == id))
             .await
     );
-    let ticket = hub.hub.begin_transcription(&id).await.unwrap();
+    let ticket = hub
+        .hub
+        .begin_transcription(&id)
+        .await
+        .unwrap()
+        .expect("transcription starts");
     let mut t = transcript_doc(&id, hub.hub.hub_id(), &new_id());
     t["status"] = json!("final");
     t["speakers"] = json!([{ "id": "S1", "isLocalUser": true }, { "id": "S2" }]);
@@ -1065,5 +1080,381 @@ async fn a_taken_port_falls_back_and_advertising_never_blocks_serving() {
             .contains(&format!("%3A{}", server.port()))
             || hub.reachable_addresses().is_empty()
     );
+    server.shutdown().await;
+}
+
+// MARK: fixes from the security and protocol review
+
+#[tokio::test]
+async fn an_already_paired_device_id_cannot_be_taken_over() {
+    let hub = start_hub().await;
+    let victim = Phone::pair(&hub, "Victim's iPhone", None).await;
+    let info = hub.hub.start_pairing();
+    // Someone who completes a pairing with the victim's (non-secret) deviceId but without its token.
+    let mut attacker = Phone::new(&hub, "Attacker");
+    attacker.device_id = victim.device_id.clone();
+    let r = attacker.pair_with(&info.code, None).await;
+    assert_eq!((r.status, r.code()), (StatusCode::FORBIDDEN, "forbidden"));
+    assert_eq!(
+        victim.get("/v1/devices/me").await.status,
+        StatusCode::OK,
+        "the victim stays paired"
+    );
+    // The code was not used up: the real phone can still pair with it.
+    let mut newcomer = Phone::new(&hub, "Newcomer");
+    assert_eq!(
+        newcomer.pair_with(&info.code, None).await.status,
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn edits_between_queueing_and_starting_are_kept() {
+    let mut hub = start_hub().await;
+    let phone = Phone::pair(&hub, "iPhone", None).await;
+    let id = new_id();
+    phone
+        .create_meeting(&meeting_doc(&id, &phone.device_id, "ended"))
+        .await;
+    let mut draft = transcript_doc(&id, &phone.device_id, &new_id());
+    let etag = phone.create_transcript(&draft).await.etag();
+    phone
+        .upload(&id, "audio.wav", "audio/wav", &wav(1.0), 1 << 20)
+        .await;
+    assert!(
+        hub.saw(|e| matches!(e, HubEvent::TranscriptionWanted { .. }))
+            .await
+    );
+    // Queued; the user edits before the computer starts.
+    draft["segments"][1]["text"] = json!("Corrected.");
+    draft["segments"][1]["edited"] = json!(true);
+    phone.update_transcript(&draft, &etag).await;
+    assert!(hub.hub.begin_transcription(&id).await.unwrap().is_none());
+    assert_eq!(
+        phone.get(&format!("/v1/meetings/{id}")).await.body["hubState"]["transcription"],
+        "skipped"
+    );
+    assert_eq!(
+        phone
+            .get(&format!("/v1/meetings/{id}/transcript"))
+            .await
+            .body["segments"][1]["text"],
+        "Corrected."
+    );
+
+    // "Transcribe again" (the user chose to replace their edits) still works.
+    let ticket = hub.hub.begin_retranscription(&id).await.unwrap();
+    let mut result = transcript_doc(&id, hub.hub.hub_id(), &new_id());
+    result["status"] = json!("final");
+    assert_eq!(
+        hub.hub.finish_transcription(ticket, result).await.unwrap(),
+        FinishOutcome::Saved
+    );
+    assert_eq!(
+        phone
+            .get(&format!("/v1/meetings/{id}/transcript"))
+            .await
+            .body["status"],
+        "final"
+    );
+}
+
+#[tokio::test]
+async fn any_change_during_transcription_wins_even_without_edited_flags() {
+    let hub = start_hub().await;
+    let phone = Phone::pair(&hub, "iPhone", None).await;
+    let id = new_id();
+    phone
+        .create_meeting(&meeting_doc(&id, &phone.device_id, "ended"))
+        .await;
+    let mut draft = transcript_doc(&id, &phone.device_id, &new_id());
+    let etag = phone.create_transcript(&draft).await.etag();
+    phone
+        .upload(&id, "audio.wav", "audio/wav", &wav(1.0), 1 << 20)
+        .await;
+    let ticket = hub.hub.begin_transcription(&id).await.unwrap().unwrap();
+    // Deleting a segment sets no `edited` flag, but it is still the user's change.
+    draft["segments"].as_array_mut().unwrap().pop();
+    assert_eq!(
+        phone.update_transcript(&draft, &etag).await.status,
+        StatusCode::OK
+    );
+    let result = transcript_doc(&id, hub.hub.hub_id(), &new_id());
+    assert_eq!(
+        hub.hub.finish_transcription(ticket, result).await.unwrap(),
+        FinishOutcome::Skipped
+    );
+    assert_eq!(
+        phone
+            .get(&format!("/v1/meetings/{id}/transcript"))
+            .await
+            .body["segments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn invalid_results_and_deleted_meetings_end_transcription_cleanly() {
+    let hub = start_hub().await;
+    let phone = Phone::pair(&hub, "iPhone", None).await;
+    let id = new_id();
+    phone
+        .create_meeting(&meeting_doc(&id, &phone.device_id, "ended"))
+        .await;
+    phone
+        .upload(&id, "audio.wav", "audio/wav", &wav(1.0), 1 << 20)
+        .await;
+    let ticket = hub.hub.begin_transcription(&id).await.unwrap().unwrap();
+    let mut bad = transcript_doc(&id, hub.hub.hub_id(), &new_id());
+    bad["segments"][1]["id"] = json!("s0001"); // duplicate id
+    assert!(hub.hub.finish_transcription(ticket, bad).await.is_err());
+    let m = phone.get(&format!("/v1/meetings/{id}")).await;
+    assert_eq!(m.body["hubState"]["transcription"], "failed");
+    // Not retried automatically by unrelated edits (a title rename).
+    let mut doc = m.body.clone();
+    doc["title"] = json!("Renamed");
+    phone.update_meeting(&doc, &m.etag()).await;
+    assert_eq!(
+        phone.get(&format!("/v1/meetings/{id}")).await.body["hubState"]["transcription"],
+        "failed"
+    );
+
+    let ticket = hub.hub.begin_retranscription(&id).await.unwrap();
+    phone
+        .send(Method::DELETE, &format!("/v1/meetings/{id}"), &[], None)
+        .await;
+    let result = transcript_doc(&id, hub.hub.hub_id(), &new_id());
+    assert_eq!(
+        hub.hub.finish_transcription(ticket, result).await.unwrap(),
+        FinishOutcome::MeetingDeleted
+    );
+}
+
+#[tokio::test]
+async fn phones_send_drafts_with_unique_ids() {
+    let hub = start_hub().await;
+    let phone = Phone::pair(&hub, "iPhone", None).await;
+    let id = new_id();
+    phone
+        .create_meeting(&meeting_doc(&id, &phone.device_id, "ended"))
+        .await;
+    let mut t = transcript_doc(&id, &phone.device_id, &new_id());
+    t["status"] = json!("final");
+    assert_eq!(phone.create_transcript(&t).await.code(), "bad_request");
+    let mut t = transcript_doc(&id, &phone.device_id, &new_id());
+    t["segments"][1]["id"] = json!("s0001");
+    assert_eq!(phone.create_transcript(&t).await.code(), "bad_request");
+    // Out of order and with a dangling speaker: stored sorted, with the reference dropped.
+    let mut t = transcript_doc(&id, &phone.device_id, &new_id());
+    t["segments"].as_array_mut().unwrap().reverse();
+    t["segments"][0]["speakerId"] = json!("S9");
+    let r = phone.create_transcript(&t).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    assert_eq!(r.body["segments"][0]["id"], "s0001");
+    assert_eq!(r.body["segments"][1]["speakerId"], Value::Null);
+}
+
+#[tokio::test]
+async fn transcription_queued_when_the_app_quit_starts_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = new_id();
+    {
+        let mut config = sync_hub::HubConfig::new(dir.path(), "Restart", "macos", "0.0.0-test");
+        config.listen = vec!["127.0.0.1:0".parse().unwrap()];
+        config.advertise = false;
+        let (hub, mut events) = sync_hub::Hub::open(config).await.unwrap();
+        let mut doc = meeting_doc(&id, hub.hub_id(), "ended");
+        doc["recordedBy"] = json!({ "deviceId": hub.hub_id(), "platform": "macos" });
+        hub.save_local_meeting(doc).await.unwrap();
+        let wav_path = dir.path().join("r.wav");
+        std::fs::write(&wav_path, wav(1.0)).unwrap();
+        hub.attach_local_audio(&id, &wav_path).await.unwrap();
+        let mut queued = false;
+        while let Ok(e) = events.try_recv() {
+            queued |= matches!(e, HubEvent::TranscriptionWanted { .. });
+        }
+        assert!(queued);
+        // The app quits before transcribing.
+    }
+    let mut config = sync_hub::HubConfig::new(dir.path(), "Restart", "macos", "0.0.0-test");
+    config.advertise = false;
+    let (_hub, mut events) = sync_hub::Hub::open(config).await.unwrap();
+    let mut again = false;
+    while let Ok(e) = events.try_recv() {
+        again |= matches!(&e, HubEvent::TranscriptionWanted { meeting_id } if *meeting_id == id);
+    }
+    assert!(again, "TranscriptionWanted again after a restart");
+}
+
+#[tokio::test]
+async fn full_sync_survives_forgotten_tombstones_and_misses_no_deletion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = sync_hub::HubConfig::new(dir.path(), "Full sync", "macos", "0.0.0-test");
+    config.listen = vec!["127.0.0.1:0".parse().unwrap()];
+    config.advertise = false;
+    config.tombstone_retention = Duration::ZERO;
+    config.trash_retention = Duration::ZERO;
+    let (hub, events) = sync_hub::Hub::open(config).await.unwrap();
+    let server = hub.serve().await.unwrap();
+    let test = TestHub {
+        base: format!("https://127.0.0.1:{}", server.port()),
+        hub,
+        server,
+        events,
+        dir,
+    };
+    let phone = Phone::pair(&test, "iPhone", None).await;
+    let ids: Vec<String> = (0..5).map(|_| new_id()).collect();
+    for id in &ids {
+        phone
+            .create_meeting(&meeting_doc(id, &phone.device_id, "ended"))
+            .await;
+    }
+    // A later meeting is deleted and its tombstone forgotten: the pruned point is past the first meetings.
+    let gone = new_id();
+    phone
+        .create_meeting(&meeting_doc(&gone, &phone.device_id, "ended"))
+        .await;
+    phone
+        .send(Method::DELETE, &format!("/v1/meetings/{gone}"), &[], None)
+        .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    test.hub.run_maintenance().await.unwrap();
+
+    // Page through a full sync two at a time; delete a meeting from page 1 while paging.
+    let page1 = phone.get("/v1/changes?limit=2").await;
+    assert_eq!(page1.body["hasMore"], true);
+    let mut cursor = page1.body["cursor"].as_str().unwrap().to_string();
+    assert!(
+        cursor.starts_with('f'),
+        "full-sync continuation cursor: {cursor}"
+    );
+    phone
+        .send(
+            Method::DELETE,
+            &format!("/v1/meetings/{}", ids[0]),
+            &[],
+            None,
+        )
+        .await;
+    let mut listed = 2;
+    loop {
+        let page = phone
+            .get(&format!("/v1/changes?limit=2&since={cursor}"))
+            .await;
+        assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+        listed += page.body["changes"].as_array().unwrap().len();
+        cursor = page.body["cursor"].as_str().unwrap().to_string();
+        if page.body["hasMore"] == false {
+            break;
+        }
+    }
+    assert_eq!(listed, 5);
+    // The final cursor is from when the full sync started, so the deletion during it comes through.
+    let after = phone.changes(Some(&cursor)).await;
+    assert!(after.body["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["meetingId"] == ids[0].as_str() && c["deleted"] == true));
+    // An old incremental cursor is expired.
+    assert_eq!(phone.changes(Some("1")).await.code(), "cursor_expired");
+}
+
+#[tokio::test]
+async fn uploads_are_limited_per_device_and_replaced_per_meeting() {
+    let hub = start_hub().await;
+    let phone = Phone::pair(&hub, "iPhone", None).await;
+    let mut started = Vec::new();
+    for i in 0..5 {
+        let id = new_id();
+        phone
+            .create_meeting(&meeting_doc(&id, &phone.device_id, "ended"))
+            .await;
+        let r = phone
+            .send(Method::POST, &format!("/v1/meetings/{id}/audio/uploads"), &[],
+                  Some(json!({ "fileName": "audio.wav", "mimeType": "audio/wav", "sizeBytes": 100, "sha256": sha256(&[i]) })))
+            .await;
+        started.push((id, r));
+    }
+    for (_, r) in &started[..4] {
+        assert_eq!(r.status, StatusCode::CREATED);
+    }
+    assert_eq!(started[4].1.code(), "rate_limited");
+    // A different file for the same meeting replaces the earlier attempt instead of adding one.
+    let (id, first) = &started[0];
+    let r = phone
+        .send(Method::POST, &format!("/v1/meetings/{id}/audio/uploads"), &[],
+              Some(json!({ "fileName": "audio.wav", "mimeType": "audio/wav", "sizeBytes": 100, "sha256": sha256(b"other") })))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    let old = first.body["uploadId"].as_str().unwrap();
+    assert_eq!(
+        phone
+            .send(Method::HEAD, &format!("/v1/uploads/{old}"), &[], None)
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    // Unknown and malformed upload IDs are simply not found.
+    assert_eq!(
+        phone
+            .append("not-an-upload-id-at-all", 0, vec![1])
+            .await
+            .code(),
+        "not_found"
+    );
+    assert_eq!(
+        phone.append(&"x".repeat(300), 0, vec![1]).await.code(),
+        "not_found"
+    );
+}
+
+#[tokio::test]
+async fn connections_are_limited_and_silent_ones_closed() {
+    use tokio::io::AsyncReadExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = sync_hub::HubConfig::new(dir.path(), "Limits", "macos", "0.0.0-test");
+    config.listen = vec!["127.0.0.1:0".parse().unwrap()];
+    config.advertise = false;
+    config.max_connections_per_address = 3;
+    config.handshake_timeout = Duration::from_millis(500);
+    config.idle_timeout = Duration::from_secs(1);
+    let (hub, _events) = sync_hub::Hub::open(config).await.unwrap();
+    let server = hub.serve().await.unwrap();
+    let addr = format!("127.0.0.1:{}", server.port());
+
+    // Three connections that never speak TLS fill this address's quota…
+    let mut idle = Vec::new();
+    for _ in 0..3 {
+        idle.push(tokio::net::TcpStream::connect(&addr).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // …so a fourth is closed at once.
+    let mut extra = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut buf))
+        .await
+        .expect("closed quickly");
+    assert!(matches!(n, Ok(0) | Err(_)));
+    // The silent ones are dropped after the handshake deadline, freeing the quota.
+    for mut s in idle {
+        let n = tokio::time::timeout(Duration::from_secs(3), s.read(&mut buf))
+            .await
+            .expect("closed by the hub");
+        assert!(matches!(n, Ok(0) | Err(_)));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let c = client(hub.fingerprint());
+    assert!(c
+        .get(format!("https://{addr}/v1/hello"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
     server.shutdown().await;
 }

@@ -71,7 +71,18 @@ pub fn allowed(peer: IpAddr, local: &[LocalNet]) -> bool {
     private || local.iter().any(|net| same_subnet(peer, net))
 }
 
+/// Narrower than these, an interface (some VPN or virtual adapters) would open the hub to everyone.
+const MIN_V4_PREFIX: u8 = 8;
+const MIN_V6_PREFIX: u8 = 48;
+
 fn same_subnet(peer: IpAddr, net: &LocalNet) -> bool {
+    let wide = match net.addr {
+        IpAddr::V4(_) => net.prefix < MIN_V4_PREFIX,
+        IpAddr::V6(_) => net.prefix < MIN_V6_PREFIX,
+    };
+    if wide {
+        return false;
+    }
     match (peer, net.addr) {
         (IpAddr::V4(a), IpAddr::V4(b)) => mask_v4(a, net.prefix) == mask_v4(b, net.prefix),
         (IpAddr::V6(a), IpAddr::V6(b)) => mask_v6(a, net.prefix) == mask_v6(b, net.prefix),
@@ -141,5 +152,17 @@ mod tests {
         assert!(!allowed(ip("2a02:a46a:1234:9999::99"), &local));
         assert!(allowed(ip("100.64.12.200"), &local));
         assert!(!allowed(ip("100.64.13.1"), &local));
+        let wide = [
+            LocalNet {
+                addr: ip("100.64.0.1"),
+                prefix: 0,
+            },
+            LocalNet {
+                addr: ip("2a02::1"),
+                prefix: 16,
+            },
+        ];
+        assert!(!allowed(ip("8.8.8.8"), &wide));
+        assert!(!allowed(ip("2a02:1::1"), &wide));
     }
 }

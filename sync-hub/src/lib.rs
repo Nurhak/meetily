@@ -14,9 +14,11 @@
 //! let pairing = hub.start_pairing(); // show pairing.qr_uri as a QR code, with pairing.code and pairing.verification
 //! while let Some(event) = events.recv().await {
 //!     if let HubEvent::TranscriptionWanted { meeting_id } = event {
-//!         let ticket = hub.begin_transcription(&meeting_id).await?;
-//!         // … transcribe ticket.audio_path, then:
-//!         // hub.finish_transcription(ticket, transcript_json).await?;
+//!         // None: the user edited the transcript meanwhile, so it is left alone.
+//!         if let Some(ticket) = hub.begin_transcription(&meeting_id).await? {
+//!             // … transcribe ticket.audio_path, then:
+//!             // hub.finish_transcription(ticket, transcript_json).await?;
+//!         }
 //!     }
 //! }
 //! server.shutdown().await;
@@ -29,6 +31,7 @@ pub mod docs;
 pub mod error;
 mod hub;
 pub mod identity;
+mod limits;
 pub mod netfilter;
 pub mod pairing;
 pub mod pinning;
@@ -118,9 +121,27 @@ impl Hub {
         let tls = RustlsConfig::from_config(self.identity().rustls_server_config()?);
         let app = api::router(self.clone());
         let handle = axum_server::Handle::new();
+        let limits = limits::ConnectionLimits::new(
+            config.max_connections,
+            config.max_connections_per_address,
+            config.idle_timeout,
+        );
         let mut tasks = Vec::new();
         for listener in listeners {
-            let server = axum_server::from_tcp_rustls(listener, tls.clone()).handle(handle.clone());
+            let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(tls.clone())
+                .handshake_timeout(config.handshake_timeout)
+                .acceptor(limits::LimitAcceptor::new(limits.clone()));
+            let mut server = axum_server::from_tcp(listener)
+                .acceptor(acceptor)
+                .handle(handle.clone());
+            // HTTP/1.1 only (the spec's transport), with a deadline for request headers.
+            let builder = server.http_builder();
+            *builder = builder.clone().http1_only();
+            builder
+                .http1()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(config.handshake_timeout)
+                .keep_alive(true);
             let service = app
                 .clone()
                 .into_make_service_with_connect_info::<SocketAddr>();

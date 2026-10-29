@@ -148,9 +148,30 @@ fn probe_mp4(path: &Path) -> Result<AudioDetails> {
 const CONTAINERS: &[&[u8; 4]] = &[b"moov", b"trak", b"mdia", b"minf", b"stbl"];
 const LEAVES: &[&[u8; 4]] = &[b"mvhd", b"stsd"];
 
+/// The deepest legitimate nesting is moov/trak/mdia/minf/stbl; anything deeper is not a recording.
+const MAX_DEPTH: u32 = 6;
+/// Box headers to read before giving up (a recording has a few dozen).
+const MAX_BOXES: u32 = 10_000;
+
 fn walk(f: &mut File, start: u64, end: u64, visit: &mut dyn FnMut(&[u8; 4], &[u8])) -> Result<()> {
+    let mut budget = MAX_BOXES;
+    walk_level(f, start, end, 0, &mut budget, visit)
+}
+
+fn walk_level(
+    f: &mut File,
+    start: u64,
+    end: u64,
+    depth: u32,
+    budget: &mut u32,
+    visit: &mut dyn FnMut(&[u8; 4], &[u8]),
+) -> Result<()> {
+    if depth > MAX_DEPTH {
+        bail!("MP4 boxes nested too deeply");
+    }
     let mut pos = start;
-    while pos + 8 <= end {
+    while pos.checked_add(8).is_some_and(|p| p <= end) {
+        *budget = budget.checked_sub(1).context("too many MP4 boxes")?;
         f.seek(SeekFrom::Start(pos))?;
         let mut head = [0u8; 8];
         f.read_exact(&mut head)?;
@@ -164,18 +185,22 @@ fn walk(f: &mut File, start: u64, end: u64, visit: &mut dyn FnMut(&[u8; 4], &[u8
             0 => (end - pos, 8),
             n => (n as u64, 8),
         };
-        if size < header_len || pos + size > end {
-            break;
+        // Every box moves forward and stays inside its parent; otherwise the file is not a valid MP4.
+        let Some(box_end) = pos.checked_add(size) else {
+            bail!("invalid MP4 box size")
+        };
+        if size < header_len || box_end > end {
+            bail!("invalid MP4 box size");
         }
         let body_start = pos + header_len;
         if CONTAINERS.contains(&&kind) {
-            walk(f, body_start, pos + size, visit)?;
+            walk_level(f, body_start, box_end, depth + 1, budget, visit)?;
         } else if LEAVES.contains(&&kind) {
             let mut body = vec![0u8; (size - header_len).min(4096) as usize];
             f.read_exact(&mut body)?;
             visit(&kind, &body);
         }
-        pos += size;
+        pos = box_end;
     }
     Ok(())
 }
@@ -264,5 +289,31 @@ mod tests {
         assert_eq!(d.sample_rate, Some(16000));
         assert_eq!(d.channels, Some(1));
         assert_eq!(d.codec.as_deref(), Some("aac"));
+    }
+
+    #[test]
+    fn malicious_mp4_files_fail_fast() {
+        use std::time::Instant;
+        // A 64-bit box size that would wrap around the file position.
+        let mut wrap = mp4_box(b"ftyp", b"M4A ");
+        wrap.extend(1u32.to_be_bytes());
+        wrap.extend(b"free");
+        wrap.extend((u64::MAX - 15).to_be_bytes());
+        // 100 000 nested moov boxes (a stack overflow without a depth limit).
+        let mut nested = Vec::new();
+        let n = 100_000u32;
+        for i in 0..n {
+            nested.extend(((n - i) * 8).to_be_bytes());
+            nested.extend(b"moov");
+        }
+        // Many tiny boxes.
+        let many: Vec<u8> = (0..50_000).flat_map(|_| mp4_box(b"free", &[])).collect();
+        for bytes in [wrap, nested, many] {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            f.write_all(&bytes).unwrap();
+            let started = Instant::now();
+            assert!(BasicProber.probe(f.path(), "audio/mp4").is_err());
+            assert!(started.elapsed().as_secs() < 2);
+        }
     }
 }

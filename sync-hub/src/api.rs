@@ -1,6 +1,7 @@
 //! HTTP routes of the sync API (spec/sync-api.openapi.yaml). Every rule lives in `hub.rs`; this maps requests and
 //! responses, enforces body limits and the local-network check.
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use axum::body::{Body, Bytes};
@@ -16,18 +17,24 @@ use axum::Router;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::decompression::RequestDecompressionLayer;
+use tower_http::timeout::RequestBodyTimeoutLayer;
 
 use crate::error::{ApiError, ApiResult};
 use crate::hub::{audio_etag, Caller, Hub, Precondition, Write, MAX_UPLOAD_CHUNK};
 
 const SMALL_BODY: usize = 64 * 1024;
+const LARGE_BODIES_AT_ONCE: usize = 4;
+const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const TRANSCRIPT_BODY: usize = 20 * 1024 * 1024;
 const UPLOAD_OFFSET: HeaderName = HeaderName::from_static("upload-offset");
 const UPLOAD_COMPLETE: HeaderName = HeaderName::from_static("upload-complete");
 
 pub fn router(hub: Hub) -> Router {
     let small = DefaultBodyLimit::max(SMALL_BODY);
+    // Large bodies are buffered and parsed in memory: only a few at a time.
+    let large = GlobalConcurrencyLimitLayer::new(LARGE_BODIES_AT_ONCE);
     Router::new()
         .route("/v1/hello", get(hello))
         .route("/v1/pair", post(pair).layer(small))
@@ -44,28 +51,32 @@ pub fn router(hub: Hub) -> Router {
             get(meeting_get)
                 .put(meeting_put)
                 .delete(meeting_delete)
-                .layer(DefaultBodyLimit::max(SMALL_BODY)),
+                .layer(small),
         )
         .route(
             "/v1/meetings/{id}/transcript",
             get(transcript_get)
                 .put(transcript_put)
-                .layer(DefaultBodyLimit::max(TRANSCRIPT_BODY)),
+                .layer::<_, Infallible>(DefaultBodyLimit::max(TRANSCRIPT_BODY))
+                .layer::<_, Infallible>(large.clone()),
         )
         .route("/v1/meetings/{id}/audio", get(audio_get))
         .route(
             "/v1/meetings/{id}/audio/uploads",
-            post(upload_start).layer(DefaultBodyLimit::max(SMALL_BODY)),
+            post(upload_start).layer(small),
         )
         .route(
             "/v1/uploads/{id}",
             axum::routing::head(upload_head)
                 .patch(upload_append)
-                .layer(DefaultBodyLimit::max(MAX_UPLOAD_CHUNK)),
+                .layer::<_, Infallible>(DefaultBodyLimit::max(MAX_UPLOAD_CHUNK))
+                .layer::<_, Infallible>(large),
         )
         .fallback(|| async { ApiError::not_found() })
         // Limits apply to the decompressed body (the decompression layer runs first).
         .layer(RequestDecompressionLayer::new())
+        // A body must arrive within this time, however slowly it trickles in.
+        .layer(RequestBodyTimeoutLayer::new(BODY_TIMEOUT))
         .layer(middleware::from_fn_with_state(
             hub.clone(),
             local_network_only,
@@ -87,21 +98,23 @@ async fn local_network_only(State(hub): State<Hub>, request: Request, next: Next
 /// The caller, from `Authorization: Bearer <token>`.
 pub struct Authed(pub Caller);
 
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && t.len() <= 128)
+}
+
 impl FromRequestParts<Hub> for Authed {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, hub: &Hub) -> Result<Self, Self::Rejection> {
-        let token = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                v.strip_prefix("Bearer ")
-                    .or_else(|| v.strip_prefix("bearer "))
-            })
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .ok_or_else(ApiError::unauthorized)?;
+        let token = bearer(&parts.headers).ok_or_else(ApiError::unauthorized)?;
         Ok(Authed(hub.authenticate(token).await?))
     }
 }
@@ -152,14 +165,13 @@ async fn hello(State(hub): State<Hub>) -> Response {
 async fn pair(
     State(hub): State<Hub>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResult<Response> {
     let body = json_body(body)?;
-    Ok(json_response(
-        StatusCode::CREATED,
-        &hub.pair(peer.ip(), &body).await?,
-        None,
-    ))
+    // Pairing an already-paired device again needs that device's current token.
+    let paired = hub.pair(peer.ip(), &body, bearer(&headers)).await?;
+    Ok(json_response(StatusCode::CREATED, &paired, None))
 }
 
 async fn device_me(State(hub): State<Hub>, Authed(caller): Authed) -> ApiResult<Response> {

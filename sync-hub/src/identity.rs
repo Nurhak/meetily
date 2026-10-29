@@ -86,6 +86,8 @@ impl HubIdentity {
                 vec![CertificateDer::from(self.cert_der.clone())],
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key_der.clone())),
             )?;
+        let mut config = config;
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Arc::new(config))
     }
 }

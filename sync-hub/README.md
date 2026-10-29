@@ -2,7 +2,7 @@
 
 The desktop app's side of the Sales Copilot **local-network sync**: phones (iOS, Android) pair with the computer by QR code and sync meetings, transcripts and recordings with it directly, with no cloud in between. The computer is the **hub**: it keeps every meeting, makes the final transcript with speaker detection, and sends it back to the phones.
 
-The protocol is specified in the [SalesMeetingCopilot](https://github.com/Nurhak/SalesMeetingCopilot) repository under `spec/`: `meeting-format.md`, `sync-protocol.md` and `sync-api.openapi.yaml`. The JSON Schemas are vendored in [`spec/schemas/`](spec/schemas/) (from SalesMeetingCopilot commit `3b0cf71`); copy them again when the spec changes.
+The protocol is specified in the [SalesMeetingCopilot](https://github.com/Nurhak/SalesMeetingCopilot) repository under `spec/`: `meeting-format.md`, `sync-protocol.md` and `sync-api.openapi.yaml`. The JSON Schemas are vendored in [`spec/schemas/`](spec/schemas/) (from SalesMeetingCopilot commit `949e6bf`); copy them again when the spec changes.
 
 ## What it does
 
@@ -38,11 +38,16 @@ hub.attach_local_audio(&meeting_id, &recording_path).await?;
 while let Some(event) = events.recv().await {
     match event {
         HubEvent::TranscriptionWanted { meeting_id } => {
-            let ticket = hub.begin_transcription(&meeting_id).await?;
+            // None: the transcript was edited since it was queued; edits are never replaced automatically.
+            let Some(ticket) = hub.begin_transcription(&meeting_id).await? else { continue };
             // transcribe ticket.audio_path (Parakeet/Whisper + diarization), reporting progress:
             hub.set_transcription_progress(&meeting_id, 0.5).await?;
-            let outcome = hub.finish_transcription(ticket, transcript_json).await?;
-            // FinishOutcome::Skipped: the user edited the transcript meanwhile; the edits were kept.
+            match hub.finish_transcription(ticket, transcript_json).await? {
+                FinishOutcome::Saved => {}
+                FinishOutcome::Skipped => { /* the user changed the transcript meanwhile; theirs stays */ }
+                FinishOutcome::MeetingDeleted => {}
+            }
+            // On an engine error: hub.fail_transcription(&meeting_id, "…").await?
         }
         HubEvent::MeetingChanged { .. } | HubEvent::TranscriptChanged { .. } => { /* refresh the UI / Meetily's database */ }
         _ => {}
@@ -50,7 +55,15 @@ while let Some(event) = events.recv().await {
 }
 ```
 
-Paired devices: `hub.devices()`, `hub.remove_device(id)`, `hub.replace_devices(new, &[old])`. Recently deleted: `hub.restore_meeting(id)`.
+Paired devices: `hub.devices()`, `hub.remove_device(id)`, `hub.replace_devices(new, &[old])`. Recently deleted: `hub.restore_meeting(id)`. "Transcribe again" (replacing the user's edits, after asking): `hub.begin_retranscription(id)`. Transcription that was queued or running when the app quit is queued again when the hub opens.
+
+## Hardening
+
+- Connections: at most 128 in total and 16 per address (`HubConfig`), closed after 90 s of silence; TLS handshake and request headers must arrive within 10 s; request bodies within 120 s; HTTP/1.1 only.
+- Large bodies (transcripts, upload parts) are handled four at a time; schema validation runs off the async threads.
+- Uploads: one unfinished upload per meeting and device (a different file replaces the earlier attempt), at most four per device, and only with 1 GiB of disk left after the file. The MP4 reader is bounded (depth, box count, sizes) and runs with a time limit outside the database lock.
+- Pairing a deviceId that is already paired needs that device's current token, so nobody can take over another phone's identity.
+- Every logical write is one SQLite transaction together with its change-feed sequence number.
 
 ## Not done yet (desktop integration)
 

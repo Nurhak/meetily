@@ -1,7 +1,9 @@
 //! Persistent hub state: SQLite (`hub.db`) for devices, documents, the change sequence and uploads; files for audio.
 //!
-//! Every read-modify-write goes through [`Store::lock`], so there is one writer at a time; readers use WAL.
-//! The change feed is coalesced by construction: each meeting row carries the sequence number of its latest change.
+//! Every read-modify-write goes through [`Store::lock`], so there is one writer at a time. Each logical write is one
+//! SQLite transaction, including its change sequence number, so readers (WAL snapshots) never see a sequence number
+//! without its row. The change feed is coalesced by construction: each meeting row carries the sequence number of its
+//! latest change.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -9,7 +11,7 @@ use std::str::FromStr;
 use anyhow::Result;
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 use tokio::sync::{Mutex, MutexGuard};
 
 pub struct Store {
@@ -150,10 +152,10 @@ impl Store {
 
     // MARK: counters
 
-    pub async fn next_seq(&self) -> Result<i64> {
+    async fn bump(conn: &mut SqliteConnection) -> Result<i64> {
         let row =
             sqlx::query("UPDATE counters SET value = value + 1 WHERE name = 'seq' RETURNING value")
-                .fetch_one(&self.pool)
+                .fetch_one(conn)
                 .await?;
         Ok(row.get(0))
     }
@@ -223,19 +225,25 @@ impl Store {
         Ok(rows.iter().map(Self::device_from_row).collect())
     }
 
-    async fn revoke_token(&self, device_id: &str, hash: Option<String>, now: &str) -> Result<()> {
+    async fn revoke_token(
+        conn: &mut SqliteConnection,
+        device_id: &str,
+        hash: Option<String>,
+        now: &str,
+    ) -> Result<()> {
         if let Some(hash) = hash {
             sqlx::query("INSERT OR REPLACE INTO revoked_tokens (token_hash, device_id, revoked_at) VALUES (?, ?, ?)")
                 .bind(hash)
                 .bind(device_id)
                 .bind(now)
-                .execute(&self.pool)
+                .execute(conn)
                 .await?;
         }
         Ok(())
     }
 
-    /// Pairs a device; for a deviceId the hub already knows, the new token replaces the old one.
+    /// Pairs a device. For a deviceId the hub already knows, the new token replaces the old one (the caller decides
+    /// whether that is allowed).
     #[allow(clippy::too_many_arguments)]
     pub async fn pair_device(
         &self,
@@ -247,13 +255,14 @@ impl Store {
         token_hash: &str,
         now: &str,
     ) -> Result<DeviceRecord> {
+        let mut tx = self.pool.begin().await?;
         let existing = sqlx::query("SELECT token_hash, scope FROM devices WHERE device_id = ?")
             .bind(device_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
         if let Some(row) = &existing {
-            self.revoke_token(device_id, row.get("token_hash"), now)
-                .await?;
+            let old: Option<String> = row.get("token_hash");
+            Self::revoke_token(&mut tx, device_id, old, now).await?;
             let scope = scope
                 .map(str::to_string)
                 .unwrap_or_else(|| row.get("scope"));
@@ -268,7 +277,7 @@ impl Store {
             .bind(token_hash)
             .bind(now)
             .bind(device_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         } else {
             sqlx::query(
@@ -282,10 +291,22 @@ impl Store {
             .bind(scope.unwrap_or("all"))
             .bind(token_hash)
             .bind(now)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(self.device(device_id).await?.expect("device just written"))
+    }
+
+    /// The token hash a device currently uses.
+    pub async fn device_token_hash(&self, device_id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query("SELECT token_hash FROM devices WHERE device_id = ?")
+                .bind(device_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .and_then(|r| r.get("token_hash")),
+        )
     }
 
     pub async fn update_device(
@@ -319,17 +340,18 @@ impl Store {
 
     /// Removes a device; its token answers `device_revoked` from then on.
     pub async fn remove_device(&self, device_id: &str, now: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query("SELECT token_hash FROM devices WHERE device_id = ?")
             .bind(device_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
         let Some(row) = row else { return Ok(false) };
-        self.revoke_token(device_id, row.get("token_hash"), now)
-            .await?;
+        Self::revoke_token(&mut tx, device_id, row.get("token_hash"), now).await?;
         sqlx::query("DELETE FROM devices WHERE device_id = ?")
             .bind(device_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(true)
     }
 
@@ -370,9 +392,7 @@ impl Store {
         row.as_ref().map(Self::meeting_from_row).transpose()
     }
 
-    /// Inserts or replaces a meeting row and gives it a new change sequence number.
-    pub async fn save_meeting(&self, m: &MeetingRow) -> Result<i64> {
-        let seq = self.next_seq().await?;
+    async fn upsert_meeting(conn: &mut SqliteConnection, m: &MeetingRow, seq: i64) -> Result<()> {
         sqlx::query(
             "INSERT INTO meetings (id, doc, revision, recorded_by, deleted_at, seq, hub_state, declared_audio, purged)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -389,52 +409,109 @@ impl Store {
         .bind(serde_json::to_string(&m.hub_state)?)
         .bind(m.declared_audio.as_ref().map(serde_json::to_string).transpose()?)
         .bind(m.purged as i64)
-        .execute(&self.pool)
+        .execute(conn)
         .await?;
+        Ok(())
+    }
+
+    /// Inserts or replaces a meeting row with a new change sequence number (and, when given, records an upload as
+    /// complete in the same transaction).
+    pub async fn save_meeting(
+        &self,
+        m: &MeetingRow,
+        completed_upload: Option<&UploadRow>,
+    ) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        let seq = Self::bump(&mut tx).await?;
+        Self::upsert_meeting(&mut tx, m, seq).await?;
+        if let Some(u) = completed_upload {
+            Self::upsert_upload(&mut tx, u).await?;
+        }
+        tx.commit().await?;
         Ok(seq)
     }
 
-    /// Bumps a meeting's change sequence without changing it (e.g. its transcript changed).
-    pub async fn touch_meeting(&self, id: &str) -> Result<i64> {
-        let seq = self.next_seq().await?;
-        sqlx::query("UPDATE meetings SET seq = ? WHERE id = ?")
-            .bind(seq)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+    /// Saves a transcript, optionally a new hubState, and gives the meeting a new change sequence number.
+    pub async fn save_transcript(
+        &self,
+        t: &TranscriptRow,
+        hub_state: Option<&Value>,
+    ) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO transcripts (meeting_id, doc, revision, generation) VALUES (?, ?, ?, ?)
+             ON CONFLICT (meeting_id) DO UPDATE SET doc = excluded.doc, revision = excluded.revision,
+               generation = excluded.generation",
+        )
+        .bind(&t.meeting_id)
+        .bind(serde_json::to_string(&t.doc)?)
+        .bind(t.revision)
+        .bind(&t.generation)
+        .execute(&mut *tx)
+        .await?;
+        let seq = Self::bump(&mut tx).await?;
+        match hub_state {
+            Some(state) => {
+                sqlx::query("UPDATE meetings SET seq = ?, hub_state = ? WHERE id = ?")
+                    .bind(seq)
+                    .bind(serde_json::to_string(state)?)
+                    .bind(&t.meeting_id)
+                    .execute(&mut *tx)
+                    .await?
+            }
+            None => {
+                sqlx::query("UPDATE meetings SET seq = ? WHERE id = ?")
+                    .bind(seq)
+                    .bind(&t.meeting_id)
+                    .execute(&mut *tx)
+                    .await?
+            }
+        };
+        tx.commit().await?;
         Ok(seq)
     }
 
-    /// Updates hubState; `bump` adds a change-feed entry (state transitions, not progress).
-    pub async fn set_hub_state(&self, id: &str, state: &Value, bump: bool) -> Result<()> {
-        if bump {
-            let seq = self.next_seq().await?;
+    /// Updates hubState; `bump` adds a change-feed entry (state transitions, not progress) and returns its number.
+    pub async fn set_hub_state(&self, id: &str, state: &Value, bump: bool) -> Result<Option<i64>> {
+        let mut tx = self.pool.begin().await?;
+        let seq = if bump {
+            let seq = Self::bump(&mut tx).await?;
             sqlx::query("UPDATE meetings SET hub_state = ?, seq = ? WHERE id = ?")
                 .bind(serde_json::to_string(state)?)
                 .bind(seq)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
+            Some(seq)
         } else {
             sqlx::query("UPDATE meetings SET hub_state = ? WHERE id = ?")
                 .bind(serde_json::to_string(state)?)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
-        }
-        Ok(())
+            None
+        };
+        tx.commit().await?;
+        Ok(seq)
     }
 
-    /// Meetings changed after `since` (or, for a full sync, every meeting that isn't deleted), oldest change first.
-    /// `visible_to`: recorder identities for scope `own`; `None` = every meeting.
+    /// One consistent snapshot of the feed: the current sequence number and the meetings changed after `since`
+    /// (with `live_only`, only meetings that aren't deleted), oldest change first. `visible_to`: recorder identities
+    /// for scope `own`; `None` = every meeting.
     pub async fn changes(
         &self,
-        since: Option<i64>,
+        since: i64,
+        live_only: bool,
         limit: i64,
         visible_to: Option<&[String]>,
-    ) -> Result<Vec<MeetingRow>> {
-        let mut sql = String::from("SELECT * FROM meetings WHERE seq > ?");
-        if since.is_none() {
+    ) -> Result<(i64, Vec<MeetingRow>)> {
+        let mut tx = self.pool.begin().await?;
+        let snapshot: i64 = sqlx::query("SELECT value FROM counters WHERE name = 'seq'")
+            .fetch_one(&mut *tx)
+            .await?
+            .get(0);
+        let mut sql = String::from("SELECT * FROM meetings WHERE seq > ? AND seq <= ?");
+        if live_only {
             sql.push_str(" AND deleted_at IS NULL");
         }
         if let Some(ids) = visible_to {
@@ -444,7 +521,7 @@ impl Store {
             ));
         }
         sql.push_str(" ORDER BY seq LIMIT ?");
-        let mut q = sqlx::query(&sql).bind(since.unwrap_or(0));
+        let mut q = sqlx::query(&sql).bind(since).bind(snapshot);
         if let Some(ids) = visible_to {
             if ids.is_empty() {
                 q = q.bind("");
@@ -453,8 +530,37 @@ impl Store {
                 q = q.bind(id);
             }
         }
-        let rows = q.bind(limit).fetch_all(&self.pool).await?;
-        rows.iter().map(Self::meeting_from_row).collect()
+        let rows = q.bind(limit).fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        Ok((
+            snapshot,
+            rows.iter()
+                .map(Self::meeting_from_row)
+                .collect::<Result<_>>()?,
+        ))
+    }
+
+    /// Meetings whose hubState.transcription is one of `states` (for recovery after a restart).
+    pub async fn meetings_in_transcription_state(
+        &self,
+        states: &[&str],
+    ) -> Result<Vec<MeetingRow>> {
+        let rows = sqlx::query("SELECT * FROM meetings WHERE deleted_at IS NULL")
+            .fetch_all(&self.pool)
+            .await?;
+        let all: Vec<MeetingRow> = rows
+            .iter()
+            .map(Self::meeting_from_row)
+            .collect::<Result<_>>()?;
+        Ok(all
+            .into_iter()
+            .filter(|m| {
+                m.hub_state
+                    .get("transcription")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| states.contains(&s))
+            })
+            .collect())
     }
 
     pub async fn meetings_deleted_before(&self, cutoff: &str) -> Result<Vec<MeetingRow>> {
@@ -468,30 +574,34 @@ impl Store {
 
     /// Drops a tombstone for good; cursors from before it get `cursor_expired`.
     pub async fn forget_meeting(&self, m: &MeetingRow) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE counters SET value = MAX(value, ?) WHERE name = 'pruned_through'")
             .bind(m.seq)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
             .bind(&m.id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM meetings WHERE id = ?")
             .bind(&m.id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn mark_purged(&self, id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE meetings SET purged = 1 WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -535,21 +645,6 @@ impl Store {
         Ok(out)
     }
 
-    pub async fn save_transcript(&self, t: &TranscriptRow) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO transcripts (meeting_id, doc, revision, generation) VALUES (?, ?, ?, ?)
-             ON CONFLICT (meeting_id) DO UPDATE SET doc = excluded.doc, revision = excluded.revision,
-               generation = excluded.generation",
-        )
-        .bind(&t.meeting_id)
-        .bind(serde_json::to_string(&t.doc)?)
-        .bind(t.revision)
-        .bind(&t.generation)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     // MARK: uploads
 
     fn upload_from_row(r: &sqlx::sqlite::SqliteRow) -> UploadRow {
@@ -576,25 +671,7 @@ impl Store {
         Ok(row.as_ref().map(Self::upload_from_row))
     }
 
-    pub async fn unfinished_upload(
-        &self,
-        meeting_id: &str,
-        sha256: &str,
-        device_id: &str,
-    ) -> Result<Option<UploadRow>> {
-        let row = sqlx::query(
-            "SELECT * FROM uploads WHERE meeting_id = ? AND sha256 = ? AND device_id = ? AND complete = 0
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(meeting_id)
-        .bind(sha256)
-        .bind(device_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.as_ref().map(Self::upload_from_row))
-    }
-
-    pub async fn save_upload(&self, u: &UploadRow) -> Result<()> {
+    async fn upsert_upload(conn: &mut SqliteConnection, u: &UploadRow) -> Result<()> {
         sqlx::query(
             "INSERT INTO uploads (id, meeting_id, device_id, file_name, mime_type, size_bytes, sha256, offset, complete, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -611,9 +688,31 @@ impl Store {
         .bind(u.offset)
         .bind(u.complete as i64)
         .bind(&u.updated_at)
-        .execute(&self.pool)
+        .execute(conn)
         .await?;
         Ok(())
+    }
+
+    pub async fn save_upload(&self, u: &UploadRow) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        Self::upsert_upload(&mut conn, u).await
+    }
+
+    /// Unfinished uploads of one device, for one meeting or all.
+    pub async fn unfinished_uploads(
+        &self,
+        device_id: &str,
+        meeting_id: Option<&str>,
+    ) -> Result<Vec<UploadRow>> {
+        let rows = sqlx::query(
+            "SELECT * FROM uploads WHERE device_id = ? AND complete = 0 AND (? IS NULL OR meeting_id = ?)",
+        )
+        .bind(device_id)
+        .bind(meeting_id)
+        .bind(meeting_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(Self::upload_from_row).collect())
     }
 
     pub async fn delete_upload(&self, id: &str) -> Result<()> {
