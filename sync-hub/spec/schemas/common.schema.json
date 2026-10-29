@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://salescopilot.local/spec/v1/common.schema.json",
+  "title": "Shared definitions",
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "description": "UUID (RFC 9562), any version, written in lowercase. Readers lowercase IDs they receive.",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "description": "RFC 3339 date-time in UTC with a Z suffix, e.g. 2026-10-29T14:05:12Z or with fractional seconds.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?Z$"
+    },
+    "languageCode": {
+      "type": "string",
+      "description": "BCP 47 tag with hyphens: language, optional script, optional region (nl, tr, en-US, zh-Hans, sr-Latn-RS). Convert en_US style locale identifiers by replacing _ with -.",
+      "pattern": "^[a-z]{2,3}(-[A-Z][a-z]{3})?(-[A-Z]{2}|-[0-9]{3})?$"
+    },
+    "seconds": {
+      "type": "number",
+      "description": "Position or length in seconds on the meeting timeline (0 = first sample of the meeting audio).",
+      "minimum": 0
+    },
+    "platform": {
+      "type": "string",
+      "enum": [
+        "ios",
+        "android",
+        "macos",
+        "windows"
+      ],
+      "x-extensible-enum": true
+    },
+    "device": {
+      "type": "object",
+      "description": "An installation of one of the apps.",
+      "required": [
+        "deviceId",
+        "platform"
+      ],
+      "properties": {
+        "deviceId": {
+          "$ref": "#/$defs/uuid",
+          "description": "Generated once per installation."
+        },
+        "deviceName": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Name the user recognises, e.g. 'Nurhak's iPhone'."
+        },
+        "platform": {
+          "$ref": "#/$defs/platform"
+        },
+        "appVersion": {
+          "type": "string",
+          "maxLength": 64
+        }
+      }
+    },
+    "timeRange": {
+      "type": "object",
+      "required": [
+        "startSec",
+        "endSec"
+      ],
+      "properties": {
+        "startSec": {
+          "$ref": "#/$defs/seconds"
+        },
+        "endSec": {
+          "$ref": "#/$defs/seconds"
+        }
+      }
+    }
+  }
+}

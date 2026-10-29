@@ -389,6 +389,10 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
   - `enhance/*`: Feature enhancements
   - Current: `fix/audio-mixing` (working on audio pipeline improvements)
 
+## Sales Copilot sync hub (`sync-hub/`)
+
+This fork is the desktop app of Sales Copilot. `sync-hub/` is a Rust crate that implements the hub side of the local-network sync protocol (phones pair by QR code and sync meetings, transcripts and recordings with the computer, no cloud). The protocol is specified in the SalesMeetingCopilot repository (`spec/`); the JSON Schemas are vendored in `sync-hub/spec/schemas/`. The crate has its own Cargo workspace (the root workspace excludes it) until the Tauri app depends on it: `cd sync-hub && cargo test`. See `sync-hub/README.md` for the API and what is left to integrate.
+
 ## Key Files Reference
 
 **Core Coordination**:

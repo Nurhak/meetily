@@ -4,6 +4,8 @@ members = [
     "frontend/src-tauri",
     "llama-helper"
 ]
+# Sales Copilot sync hub: its own workspace until the desktop app depends on it.
+exclude = ["sync-hub"]
 
 # Shared workspace settings
 [workspace.package]
