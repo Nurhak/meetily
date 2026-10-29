@@ -1,0 +1,275 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://salescopilot.local/spec/v1/meeting.schema.json",
+  "title": "meeting.json",
+  "description": "Metadata of one meeting. See spec/meeting-format.md. Unknown properties must be kept when the file is rewritten.",
+  "type": "object",
+  "required": [
+    "formatVersion",
+    "id",
+    "revision",
+    "updatedAt",
+    "updatedBy",
+    "startedAt",
+    "status",
+    "recordedBy",
+    "capture"
+  ],
+  "properties": {
+    "formatVersion": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "common.schema.json#/$defs/uuid",
+      "description": "Meeting ID, created by the device that recorded or imported the meeting. Never changes."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Owned by the hub: a per-document counter, 1 when the hub first accepts the meeting, +1 per accepted change. 0 = never accepted. Recorders send their base revision; the hub ignores it."
+    },
+    "updatedAt": {
+      "$ref": "common.schema.json#/$defs/timestamp",
+      "description": "Owned by the hub; recorders send their own clock and the hub replaces it."
+    },
+    "updatedBy": {
+      "$ref": "common.schema.json#/$defs/uuid",
+      "description": "deviceId of the last device that changed this file. The hub takes it from the caller's token."
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 300,
+      "description": "Set by the user; apps fall back to the start date when null."
+    },
+    "startedAt": {
+      "$ref": "common.schema.json#/$defs/timestamp"
+    },
+    "endedAt": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "timeZone": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "IANA zone of the recording device, e.g. Europe/Amsterdam; for display only."
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "recording",
+        "ended"
+      ],
+      "description": "Only ended meetings are synced with audio and transcripts."
+    },
+    "languageCode": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/languageCode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Language chosen for transcription; null = detect automatically."
+    },
+    "recordedBy": {
+      "$ref": "common.schema.json#/$defs/device",
+      "description": "Set at creation (must be the creating device), never changed."
+    },
+    "capture": {
+      "type": "object",
+      "required": [
+        "channel",
+        "trigger"
+      ],
+      "properties": {
+        "channel": {
+          "type": "string",
+          "enum": [
+            "in-person",
+            "online-call",
+            "phone-call",
+            "file-import"
+          ],
+          "description": "How the conversation took place. phone-call = a recording made by the phone's own dialer and imported.",
+          "x-extensible-enum": true
+        },
+        "meetingApp": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "teams",
+            "zoom",
+            "google-meet",
+            "webex",
+            "slack",
+            "whatsapp",
+            "other",
+            null
+          ],
+          "description": "Meeting app in use for online calls, when known.",
+          "x-extensible-enum": true
+        },
+        "trigger": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "meeting-detection",
+            "calendar-reminder",
+            "shortcut",
+            "import"
+          ],
+          "description": "What started the recording.",
+          "x-extensible-enum": true
+        },
+        "audioSources": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "microphone",
+              "system"
+            ],
+            "x-extensible-enum": true
+          },
+          "uniqueItems": true,
+          "description": "Inputs mixed into the audio file. system = other participants' call audio, captured on a computer."
+        },
+        "calendarEventTitle": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 300
+        }
+      }
+    },
+    "audio": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/audio"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The recording, or null until there is one. Owned by the hub in the API: set after an upload passes its checksum check and ignored on input. A recording is never replaced."
+    },
+    "deletedAt": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Set by the hub when the meeting was deleted everywhere (tombstone). Ignored on input; deleting uses DELETE /v1/meetings/{id}."
+    },
+    "hubState": {
+      "$ref": "#/$defs/hubState",
+      "description": "Only in API responses, never in bundles. Excluded from revision, ETag, merging and equality; ignored on input."
+    }
+  },
+  "$defs": {
+    "audio": {
+      "type": "object",
+      "required": [
+        "fileName",
+        "mimeType",
+        "durationSec",
+        "sizeBytes",
+        "sha256"
+      ],
+      "properties": {
+        "fileName": {
+          "type": "string",
+          "pattern": "^audio\\.(m4a|mp4|wav|ogg|opus|flac|mp3)$",
+          "description": "File name inside the meeting bundle."
+        },
+        "mimeType": {
+          "type": "string",
+          "enum": [
+            "audio/mp4",
+            "audio/wav",
+            "audio/ogg",
+            "audio/flac",
+            "audio/mpeg"
+          ],
+          "description": "Closed enum."
+        },
+        "codec": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "e.g. aac, opus, pcm_s16le"
+        },
+        "durationSec": {
+          "$ref": "common.schema.json#/$defs/seconds"
+        },
+        "sampleRate": {
+          "type": "integer",
+          "minimum": 8000
+        },
+        "channels": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967296
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 of the file, lowercase hex."
+        }
+      }
+    },
+    "hubState": {
+      "type": "object",
+      "properties": {
+        "audioReceived": {
+          "type": "boolean"
+        },
+        "transcription": {
+          "type": "string",
+          "enum": [
+            "none",
+            "queued",
+            "running",
+            "done",
+            "skipped",
+            "failed"
+          ],
+          "x-extensible-enum": true,
+          "description": "skipped = the transcript was edited before or changed during transcription, so the result was not saved."
+        },
+        "transcriptionProgress": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "transcriptionError": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1000
+        }
+      }
+    }
+  }
+}
