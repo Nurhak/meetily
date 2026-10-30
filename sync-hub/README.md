@@ -83,3 +83,16 @@ cargo clippy -p salescopilot-sync-hub --all-targets
 The end-to-end tests (`tests/sync_e2e.rs`) pin the hub's key like the phones do and cover pairing (including limits and re-pairing), preconditions and conflicts, hub-owned fields, schema leniency, gzip and size limits, transcripts and generations, resumable uploads with checksums, downloads with `Range`/`If-Range`, the change feed with paging, long polling and full sync, scope and permissions, deletion and restore, device replacement, desktop meetings, and the transcription hand-off including edits that must not be overwritten.
 
 The crate is a member of the root workspace; building and testing it doesn't build the Tauri app.
+
+### Fake phone
+
+`examples/fake_phone.rs` acts as a phone against a running desktop app (Settings → Phones turned on), using the test clients in `tests/common`, so phone → computer sync can be tried without a phone:
+
+```sh
+cargo run -p salescopilot-sync-hub --example fake_phone -- pair ABCD-EFGH     # the code from "Pair a phone"; compare the verification number
+cargo run -p salescopilot-sync-hub --example fake_phone -- record --say "Hello, this is a test meeting."   # meeting + draft + WAV (macOS `say`)
+cargo run -p salescopilot-sync-hub --example fake_phone -- watch <meetingId>  # waits for the computer's final transcript
+cargo run -p salescopilot-sync-hub --example fake_phone -- changes
+```
+
+The token and pinned key are kept in `$TMPDIR/salescopilot-fake-phone.json` (`--state FILE` to change it).
