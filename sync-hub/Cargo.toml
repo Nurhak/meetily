@@ -6,9 +6,6 @@ description = "Hub side of the Sales Copilot local-network sync protocol (spec/s
 license = "MIT"
 publish = false
 
-# Built on its own until the desktop app depends on it; the root workspace excludes this directory.
-[workspace]
-
 [lib]
 name = "sync_hub"
 

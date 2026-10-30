@@ -51,6 +51,7 @@ pub mod openrouter;
 pub mod parakeet_engine;
 pub mod state;
 pub mod summary;
+pub mod sync;
 pub mod tray;
 pub mod utils;
 pub mod whisper_engine;
@@ -474,7 +475,11 @@ pub fn run() {
         )) as NotificationManagerState<tauri::Wry>)
         .manage(audio::init_system_audio_state())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
+        .manage(sync::SyncState::default())
         .setup(|_app| {
+            // Phone sync starts once the database is ready (after onboarding on a first launch)
+            sync::start(_app.handle().clone());
+
             #[cfg(target_os = "windows")]
             match _app.path().resolve(
                 "onnxruntime.dll",
@@ -830,6 +835,17 @@ pub fn run() {
             audio::import::start_import_audio_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
+            // Phone sync (Sales Copilot)
+            sync::sync_status,
+            sync::sync_set_enabled,
+            sync::sync_set_name,
+            sync::sync_start_pairing,
+            sync::sync_cancel_pairing,
+            sync::sync_devices,
+            sync::sync_remove_device,
+            sync::sync_recently_deleted,
+            sync::sync_restore_meeting,
+            sync::sync_meetings_changed,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -842,6 +858,9 @@ pub fn run() {
                 tauri::RunEvent::Exit => {
                     log::info!("Application exiting, cleaning up resources...");
                     tauri::async_runtime::block_on(async {
+                        // Stop phone sync before the database goes away
+                        sync::shutdown(_app_handle).await;
+
                         // Clean up database connection and checkpoint WAL
                         if let Some(app_state) = _app_handle.try_state::<state::AppState>() {
                             log::info!("Starting database cleanup...");

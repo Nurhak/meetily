@@ -563,6 +563,21 @@ impl Store {
             .collect())
     }
 
+    /// IDs of every meeting the hub holds, including tombstones.
+    pub async fn meeting_ids(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT id FROM meetings ORDER BY seq").fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    /// Deleted meetings that can still be restored, newest deletion first.
+    pub async fn restorable_meetings(&self) -> Result<Vec<MeetingRow>> {
+        let rows =
+            sqlx::query("SELECT * FROM meetings WHERE deleted_at IS NOT NULL AND purged = 0 ORDER BY deleted_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(Self::meeting_from_row).collect()
+    }
+
     pub async fn meetings_deleted_before(&self, cutoff: &str) -> Result<Vec<MeetingRow>> {
         let rows =
             sqlx::query("SELECT * FROM meetings WHERE deleted_at IS NOT NULL AND deleted_at < ?")

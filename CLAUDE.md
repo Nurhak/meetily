@@ -389,9 +389,15 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
   - `enhance/*`: Feature enhancements
   - Current: `fix/audio-mixing` (working on audio pipeline improvements)
 
-## Sales Copilot sync hub (`sync-hub/`)
+## Sales Copilot phone sync (`sync-hub/`, `sync-bridge/`)
 
-This fork is the desktop app of Sales Copilot. `sync-hub/` is a Rust crate that implements the hub side of the local-network sync protocol (phones pair by QR code and sync meetings, transcripts and recordings with the computer, no cloud). The protocol is specified in the SalesMeetingCopilot repository (`spec/`); the JSON Schemas are vendored in `sync-hub/spec/schemas/`. The crate has its own Cargo workspace (the root workspace excludes it) until the Tauri app depends on it: `cd sync-hub && cargo test`. See `sync-hub/README.md` for the API and what is left to integrate.
+This fork is the desktop app of Sales Copilot. Phones pair by QR code and sync meetings, transcripts and recordings with the computer over the local network, no cloud. The protocol is specified in the SalesMeetingCopilot repository (`spec/`); the JSON Schemas are vendored in `sync-hub/spec/schemas/`.
+
+- `sync-hub/`: the hub side of the protocol (HTTPS server, pairing, DNS-SD, change feed, uploads). See `sync-hub/README.md`.
+- `sync-bridge/`: keeps Meetily's `meetings`/`transcripts` and the hub in step (reconciles per meeting; desktop edits win on conflict), imports phone meetings like audio imports, and runs Meetily's retranscription when the hub wants a final transcript. `SyncService` is what the app drives. See `sync-bridge/README.md`.
+- `frontend/src-tauri/src/sync.rs`: starts the service once `AppState` exists, `sync_*` Tauri commands, events `sync-meetings-changed` and `sync-device-paired`. UI: Settings → Phones (`frontend/src/components/PhoneSyncSettings.tsx`).
+
+Both crates are root workspace members: `cargo test -p salescopilot-sync-hub -p salescopilot-sync-bridge` (doesn't build the Tauri app). The bridge tests build a Meetily database from `frontend/src-tauri/migrations`, so schema changes there can break them.
 
 ## Key Files Reference
 
