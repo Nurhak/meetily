@@ -65,22 +65,34 @@ Paired devices: `hub.devices()`, `hub.remove_device(id)`, `hub.replace_devices(n
 - Pairing a deviceId that is already paired needs that device's current token, so nobody can take over another phone's identity.
 - Every logical write is one SQLite transaction together with its change-feed sequence number.
 
-## Not done yet (desktop integration)
+## Not done yet
 
-- Depend on this crate from `frontend/src-tauri`, run the hub in the Tauri app, and add Tauri commands and the UI: **Add phone** (QR code, code, verification number), **Paired devices**, **Recently deleted**, sync on/off.
-- Map Meetily's database to the meeting format (meeting IDs `meeting-<uuid>`, `transcripts` rows → segments, `mic`/`system` → `audioSource`) in both directions.
-- Feed `TranscriptionWanted` into the existing Parakeet/Whisper pipeline, and plug in the Symphonia-based prober for formats other than WAV and M4A.
+The desktop app runs the hub through [`sync-bridge`](../sync-bridge/README.md), which maps Meetily's meetings to the meeting format in both directions and feeds `TranscriptionWanted` into Meetily's retranscription. Still open:
+
+- Speaker detection for transcripts made on the computer, and the Symphonia-based prober for formats other than WAV and M4A.
 - Keep the hub's private key in the Keychain (macOS) and DPAPI (Windows); it is a file readable only by the owner for now (`identity/key.pem`).
 - Windows installer: firewall rule for Private and Domain networks; the Public-network prompt.
 
 ## Tests
 
 ```sh
-cd sync-hub
-cargo test          # unit tests + end-to-end tests: a hub on localhost and clients that act like phones
-cargo clippy --all-targets
+cargo test -p salescopilot-sync-hub    # unit tests + end-to-end tests: a hub on localhost and clients that act like phones
+cargo clippy -p salescopilot-sync-hub --all-targets
 ```
 
 The end-to-end tests (`tests/sync_e2e.rs`) pin the hub's key like the phones do and cover pairing (including limits and re-pairing), preconditions and conflicts, hub-owned fields, schema leniency, gzip and size limits, transcripts and generations, resumable uploads with checksums, downloads with `Range`/`If-Range`, the change feed with paging, long polling and full sync, scope and permissions, deletion and restore, device replacement, desktop meetings, and the transcription hand-off including edits that must not be overwritten.
 
-This crate has its own Cargo workspace for now (the root workspace excludes it), so it builds without the Tauri app's dependencies.
+The crate is a member of the root workspace; building and testing it doesn't build the Tauri app.
+
+### Fake phone
+
+`examples/fake_phone.rs` acts as a phone against a running desktop app (Settings → Phones turned on), using the test clients in `tests/common`, so phone → computer sync can be tried without a phone:
+
+```sh
+cargo run -p salescopilot-sync-hub --example fake_phone -- pair ABCD-EFGH     # the code from "Pair a phone"; compare the verification number
+cargo run -p salescopilot-sync-hub --example fake_phone -- record --say "Hello, this is a test meeting."   # meeting + draft + WAV (macOS `say`)
+cargo run -p salescopilot-sync-hub --example fake_phone -- watch <meetingId>  # waits for the computer's final transcript
+cargo run -p salescopilot-sync-hub --example fake_phone -- changes
+```
+
+The token and pinned key are kept in `$TMPDIR/salescopilot-fake-phone.json` (`--state FILE` to change it).

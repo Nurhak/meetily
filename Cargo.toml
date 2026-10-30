@@ -2,10 +2,10 @@
 resolver = "2"
 members = [
     "frontend/src-tauri",
-    "llama-helper"
+    "llama-helper",
+    "sync-hub",
+    "sync-bridge"
 ]
-# Sales Copilot sync hub: its own workspace until the desktop app depends on it.
-exclude = ["sync-hub"]
 
 # Shared workspace settings
 [workspace.package]

@@ -1,0 +1,33 @@
+[package]
+name = "salescopilot-sync-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Connects the Sales Copilot sync hub to Meetily's meetings: desktop meetings go to the phones, phone meetings appear in Meetily"
+license = "MIT"
+publish = false
+
+[lib]
+name = "sync_bridge"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures-util = "0.3"
+hex = "0.4"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "chrono"] }
+salescopilot-sync-hub = { path = "../sync-hub" }
+tokio = { version = "1.40", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots-no-provider", "json"] }
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tempfile = "3"

@@ -8,6 +8,12 @@
     <string>This application needs screen recording permission to capture system audio during meetings.</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>This application needs permission to capture system audio output for meeting transcription and recording.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Phone sync uses your local network so phones with the Sales Copilot app can find this computer and sync meetings with it, without the cloud.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_salescopilot._tcp</string>
+    </array>
     <key>com.apple.security.device.audio-input</key>
     <true/>
 </dict>

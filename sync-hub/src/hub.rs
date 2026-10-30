@@ -1939,7 +1939,8 @@ impl Hub {
         anyhow::bail!("meeting {id} kept changing while saving")
     }
 
-    /// Attaches a recording made on this computer (copied into the hub's store).
+    /// Attaches a recording made on this computer. It is hard-linked into the hub's store when both are on the same
+    /// volume (no extra disk space; recordings are not modified afterwards), and copied otherwise.
     pub async fn attach_local_audio(&self, meeting_id: &str, source: &Path) -> anyhow::Result<()> {
         let file_name = source
             .file_name()
@@ -1959,7 +1960,9 @@ impl Hub {
         let staging = self
             .store()
             .upload_path(&format!("local-{}", uuid::Uuid::new_v4()));
-        tokio::fs::copy(source, &staging).await?;
+        if tokio::fs::hard_link(source, &staging).await.is_err() {
+            tokio::fs::copy(source, &staging).await?;
+        }
         let sha = sha256_file(&staging).await?;
         let result = self
             .attach_audio(
@@ -2015,6 +2018,37 @@ impl Hub {
         };
         let transcript = self.store().transcript(meeting_id).await?.map(|t| t.doc);
         Ok(Some((Self::meeting_view(&row), transcript)))
+    }
+
+    /// Every meeting the hub holds, including deleted ones (for the desktop app's own bookkeeping).
+    pub async fn meeting_ids(&self) -> anyhow::Result<Vec<String>> {
+        self.store().meeting_ids().await
+    }
+
+    /// The meeting's recording on this computer, when the hub has it.
+    pub async fn local_audio_path(&self, meeting_id: &str) -> anyhow::Result<Option<PathBuf>> {
+        let Some(row) = self.store().meeting(meeting_id).await? else {
+            return Ok(None);
+        };
+        let Some(file) = row.doc.pointer("/audio/fileName").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        if !FILE_NAMES.contains(&file) {
+            return Ok(None);
+        }
+        let path = self.store().audio_dir(meeting_id).join(file);
+        Ok(path.exists().then_some(path))
+    }
+
+    /// "Recently deleted": meetings deleted everywhere that can still be restored, newest first.
+    pub async fn recently_deleted(&self) -> anyhow::Result<Vec<Value>> {
+        Ok(self
+            .store()
+            .restorable_meetings()
+            .await?
+            .iter()
+            .map(Self::meeting_view)
+            .collect())
     }
 
     // MARK: maintenance

@@ -6,6 +6,7 @@ import PageContent from "./page-content";
 import { useRouter, useSearchParams } from "next/navigation";
 import Analytics from "@/lib/analytics";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
@@ -49,6 +50,17 @@ function MeetingDetailsContent() {
     refetch,
     error: transcriptError,
   } = usePaginatedTranscripts({ meetingId: meetingId || '' });
+
+  // Phone sync can change this meeting's transcript (e.g. a phone recording just got transcribed here)
+  useEffect(() => {
+    if (!meetingId || meetingId === 'intro-call') return;
+    const unlisten = listen('sync-meetings-changed', () => {
+      refetch();
+    });
+    return () => {
+      unlisten.then(f => f());
+    };
+  }, [meetingId, refetch]);
 
   // Check if gemma3:1b model is available in Ollama
   const checkForGemmaModel = useCallback(async (): Promise<boolean> => {
