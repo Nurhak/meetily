@@ -391,11 +391,11 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 
 ## Sales Copilot phone sync (`sync-hub/`, `sync-bridge/`)
 
-This fork is the desktop app of Sales Copilot. Phones pair by QR code and sync meetings, transcripts and recordings with the computer over the local network, no cloud. The protocol is specified in the SalesMeetingCopilot repository (`spec/`); the JSON Schemas are vendored in `sync-hub/spec/schemas/`.
+This fork is the desktop app of Sales Copilot. Phones pair by QR code and sync meetings, transcripts and recordings with the computer directly (shared network, hotspot, peer-to-peer Wi-Fi, Bluetooth LE), no cloud. The protocol is specified in the SalesMeetingCopilot repository (`spec/`); the JSON Schemas are vendored in `sync-hub/spec/schemas/`.
 
-- `sync-hub/`: the hub side of the protocol (HTTPS server, pairing, DNS-SD, change feed, uploads). See `sync-hub/README.md`.
+- `sync-hub/`: the hub side of the protocol (HTTPS server, pairing, DNS-SD incl. Apple peer-to-peer Wi-Fi on macOS, change feed, uploads, live transcription over a WebSocket, the Bluetooth LE channel layer). See `sync-hub/README.md`; `examples/fake_phone.rs` acts as a phone against the running app.
 - `sync-bridge/`: keeps Meetily's `meetings`/`transcripts` and the hub in step (reconciles per meeting; desktop edits win on conflict), imports phone meetings like audio imports, and runs Meetily's retranscription when the hub wants a final transcript. `SyncService` is what the app drives. See `sync-bridge/README.md`.
-- `frontend/src-tauri/src/sync.rs`: starts the service once `AppState` exists, `sync_*` Tauri commands, events `sync-meetings-changed` and `sync-device-paired`. UI: Settings → Phones (`frontend/src/components/PhoneSyncSettings.tsx`).
+- `frontend/src-tauri/src/sync.rs`: starts the service once `AppState` exists, live transcription for phones with Meetily's VAD and engine (`MeetilyLive`), `sync_*` Tauri commands, events `sync-meetings-changed`, `sync-device-paired` and `sync-live-changed`. UI: Settings → Phones (`frontend/src/components/PhoneSyncSettings.tsx`).
 
 Both crates are root workspace members: `cargo test -p salescopilot-sync-hub -p salescopilot-sync-bridge` (doesn't build the Tauri app). The bridge tests build a Meetily database from `frontend/src-tauri/migrations`, so schema changes there can break them.
 

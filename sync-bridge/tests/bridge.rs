@@ -25,6 +25,19 @@ enum Behaviour {
     Fail(&'static str),
 }
 
+/// Live transcription that is never available (the service test only checks that phones are told about it).
+struct BusyLive;
+
+impl sync_bridge::sync_hub::LiveTranscriber for BusyLive {
+    fn check(&self) -> Result<(), sync_bridge::sync_hub::LiveError> {
+        Err(sync_bridge::sync_hub::LiveError::Unavailable { retry_after_secs: 30, reason: "recording".into() })
+    }
+
+    fn open(&self, _start: sync_bridge::sync_hub::LiveStart) -> sync_bridge::sync_hub::LiveOpening {
+        Box::pin(async { Err(sync_bridge::sync_hub::LiveError::Failed("not in this test".into())) })
+    }
+}
+
 struct FakeTranscriber {
     pool: SqlitePool,
     behaviour: Mutex<Behaviour>,
@@ -560,6 +573,7 @@ async fn the_service_turns_sync_on_and_off_and_pairs() {
                 platform: "macos".into(),
                 app_version: "0.4.1".into(),
                 recordings_dir: Arc::new({ let r = recordings.clone(); move || r.clone() }),
+                live: Some(Arc::new(BusyLive)),
             },
             meetily.clone(),
             transcriber.clone(),
@@ -574,6 +588,20 @@ async fn the_service_turns_sync_on_and_off_and_pairs() {
     let on = service.set_enabled(true).await.unwrap();
     assert!(on.enabled && on.running && on.port.is_some(), "{on:?}");
     assert_eq!(on.fingerprint.as_ref().map(|f| f.len()), Some(43));
+    assert_eq!((on.live_sessions, on.direct_links.len()), (0, 0));
+    // Phones see that this computer offers live transcription.
+    let hello: Value = reqwest::Client::builder()
+        .use_preconfigured_tls(PinnedKeyVerifier::client_config(on.fingerprint.clone().unwrap()))
+        .build()
+        .unwrap()
+        .get(format!("https://127.0.0.1:{}/v1/hello", on.port.unwrap()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hello["features"], json!(["live-transcription"]));
     let pairing = service.start_pairing().await.unwrap();
     assert!(pairing.qr_svg.starts_with("<?xml") || pairing.qr_svg.contains("<svg"));
     assert_eq!(pairing.code.len(), 9);

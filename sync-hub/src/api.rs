@@ -6,6 +6,8 @@ use std::net::SocketAddr;
 
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, Request, State};
 use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use axum::http::request::Parts;
@@ -23,6 +25,7 @@ use tower_http::timeout::RequestBodyTimeoutLayer;
 
 use crate::error::{ApiError, ApiResult};
 use crate::hub::{audio_etag, Caller, Hub, Precondition, Write, MAX_UPLOAD_CHUNK};
+use crate::live::{self, LiveError};
 
 const SMALL_BODY: usize = 64 * 1024;
 const LARGE_BODIES_AT_ONCE: usize = 4;
@@ -61,6 +64,8 @@ pub fn router(hub: Hub) -> Router {
                 .layer::<_, Infallible>(large.clone()),
         )
         .route("/v1/meetings/{id}/audio", get(audio_get))
+        .route("/v1/meetings/{id}/live", get(live))
+        .route("/v1/connections", get(connections))
         .route(
             "/v1/meetings/{id}/audio/uploads",
             post(upload_start).layer(small),
@@ -160,6 +165,37 @@ fn precondition(headers: &HeaderMap) -> ApiResult<Precondition> {
 
 async fn hello(State(hub): State<Hub>) -> Response {
     json_response(StatusCode::OK, &hub.hello(), None)
+}
+
+async fn connections(State(hub): State<Hub>, Authed(_caller): Authed) -> Response {
+    json_response(StatusCode::OK, &hub.connections(), None)
+}
+
+/// `GET /v1/meetings/{id}/live`: checks, then hands the WebSocket to `live::run`.
+async fn live(
+    State(hub): State<Hub>,
+    Authed(caller): Authed,
+    Path(id): Path<String>,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> ApiResult<Response> {
+    let transcriber = hub.live_transcriber().ok_or_else(ApiError::not_found)?;
+    let meeting_id = hub.check_live_meeting(&caller, &id).await?;
+    transcriber.check().map_err(|e| match e {
+        LiveError::Unavailable { retry_after_secs, reason } => {
+            ApiError::transcriber_unavailable(retry_after_secs, reason)
+        }
+        LiveError::Failed(reason) => ApiError::transcriber_unavailable(60, reason),
+    })?;
+    let ws = ws
+        .map_err(|e| ApiError::bad_request(format!("expected a WebSocket upgrade: {}", e.body_text())))?
+        .protocols([live::SUBPROTOCOL])
+        .max_frame_size(live::MAX_AUDIO_FRAME)
+        .max_message_size(live::MAX_AUDIO_FRAME);
+    if ws.selected_protocol().is_none() {
+        return Err(ApiError::bad_request(format!("the subprotocol must be {}", live::SUBPROTOCOL)));
+    }
+    let device_id = caller.device_id(hub.hub_id());
+    Ok(ws.on_upgrade(move |socket| live::run(hub, transcriber, device_id, meeting_id, socket)))
 }
 
 async fn pair(

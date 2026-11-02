@@ -78,6 +78,11 @@ impl ApiError {
         Self::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited")
             .header(axum::http::header::RETRY_AFTER, retry_after_secs)
     }
+    pub fn transcriber_unavailable(retry_after_secs: u64, reason: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "transcriber_unavailable")
+            .header(axum::http::header::RETRY_AFTER, retry_after_secs.max(1))
+            .detail(reason)
+    }
     pub fn internal(err: impl std::fmt::Display) -> Self {
         tracing::error!(target: "sync_hub", "internal error: {err}");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")

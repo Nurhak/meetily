@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::SqlitePool;
-use sync_hub::{Hub, HubConfig, RunningHub};
+use sync_hub::{Hub, HubConfig, LiveTranscriber, RunningHub};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::bridge::{Bridge, BridgeConfig, BridgeEvent, Transcriber};
@@ -22,6 +22,8 @@ pub struct ServiceConfig {
     pub app_version: String,
     /// Meetily's recordings folder; meetings from phones get their folders there.
     pub recordings_dir: Arc<dyn Fn() -> PathBuf + Send + Sync>,
+    /// Live transcription for phones while they record; `None` leaves it off.
+    pub live: Option<Arc<dyn LiveTranscriber>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -43,6 +45,10 @@ pub struct SyncStatus {
     pub port: Option<u16>,
     pub addresses: Vec<String>,
     pub paired_devices: usize,
+    /// Phones getting live transcription now.
+    pub live_sessions: usize,
+    /// Direct links on offer besides the shared network (`p2p`, `wd`, `bt`).
+    pub direct_links: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -159,6 +165,7 @@ impl SyncService {
             self.config.app_version.clone(),
         );
         let (hub, events) = Hub::open(hub_config).await.context("opening the sync store")?;
+        hub.set_live_transcriber(self.config.live.clone());
         let server = hub.serve().await.context("starting the sync server")?;
         let bridge = Bridge::start(
             hub.clone(),
@@ -197,6 +204,8 @@ impl SyncService {
             port: None,
             addresses: Vec::new(),
             paired_devices: 0,
+            live_sessions: 0,
+            direct_links: Vec::new(),
             error: state.error.clone(),
         };
         if let Some(r) = &state.running {
@@ -205,6 +214,8 @@ impl SyncService {
             status.port = Some(r.server.port());
             status.addresses = r.hub.reachable_addresses().iter().map(|a| a.to_string()).collect();
             status.paired_devices = r.hub.devices().await.map(|d| d.len()).unwrap_or(0);
+            status.live_sessions = r.hub.live_session_count();
+            status.direct_links = r.hub.direct_links().links;
         }
         status
     }

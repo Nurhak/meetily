@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, watch};
 use crate::docs::{self, MEETING_HUB_OWNED, TRANSCRIPT_HUB_OWNED};
 use crate::error::{ApiError, ApiResult};
 use crate::identity::HubIdentity;
+use crate::live::{self, LiveTranscriber};
 use crate::netfilter::NetFilter;
 use crate::pairing::{Attempt, PairingInfo, PairingSession};
 use crate::probe::{AudioDetails, AudioProber, BasicProber};
@@ -123,7 +124,7 @@ pub enum Caller {
 }
 
 impl Caller {
-    fn device_id(&self, hub_id: &str) -> String {
+    pub(crate) fn device_id(&self, hub_id: &str) -> String {
         match self {
             Caller::Hub => hub_id.to_string(),
             Caller::Device(d) => d.device_id.clone(),
@@ -386,6 +387,19 @@ struct Inner {
     upload_locks: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     prober: Arc<dyn AudioProber>,
     listening: RwLock<Vec<SocketAddr>>,
+    live: RwLock<Option<Arc<dyn LiveTranscriber>>>,
+    live_sessions: live::Sessions,
+    /// Direct links on offer besides the shared network (`p2p`, `wd`, `bt`) and the Wi-Fi Direct group.
+    links: RwLock<DirectLinks>,
+}
+
+/// Direct links the hub offers now (sync-protocol.md, "Connections").
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DirectLinks {
+    /// `p2p` (Apple peer-to-peer Wi-Fi), `wd` (Wi-Fi Direct), `bt` (Bluetooth LE).
+    pub links: Vec<String>,
+    /// Network name and passphrase of the Wi-Fi Direct group.
+    pub wifi_direct: Option<(String, String)>,
 }
 
 impl Hub {
@@ -420,6 +434,9 @@ impl Hub {
                 upload_locks: StdMutex::new(HashMap::new()),
                 prober,
                 listening: RwLock::new(Vec::new()),
+                live: RwLock::new(None),
+                live_sessions: live::Sessions::default(),
+                links: RwLock::new(DirectLinks::default()),
             }),
         };
         hub.recover_transcriptions().await?;
@@ -505,13 +522,80 @@ impl Hub {
     // MARK: hello and pairing
 
     pub fn hello(&self) -> Value {
-        json!({
+        let mut hello = json!({
             "hubId": self.hub_id(),
             "name": self.inner.config.name,
             "platform": self.inner.config.platform,
             "appVersion": self.inner.config.app_version,
             "protocolVersions": [PROTOCOL_VERSION],
             "formatVersions": [FORMAT_VERSION],
+        });
+        if self.live_transcriber().is_some() {
+            if let (Some(obj), Value::Object(extra)) = (hello.as_object_mut(), live::hello_fields()) {
+                obj.extend(extra);
+            }
+        }
+        hello
+    }
+
+    // MARK: live transcription and direct links
+
+    /// Turns live transcription on (or off with `None`). Phones see it in `GET /v1/hello`.
+    pub fn set_live_transcriber(&self, transcriber: Option<Arc<dyn LiveTranscriber>>) {
+        *self.inner.live.write().unwrap() = transcriber;
+    }
+
+    pub fn live_transcriber(&self) -> Option<Arc<dyn LiveTranscriber>> {
+        self.inner.live.read().unwrap().clone()
+    }
+
+    pub(crate) fn live_sessions(&self) -> &live::Sessions {
+        &self.inner.live_sessions
+    }
+
+    /// Live sessions open now.
+    pub fn live_session_count(&self) -> usize {
+        self.inner.live_sessions.count()
+    }
+
+    /// The checks before a live session: the meeting exists for this caller, isn't deleted and is recording.
+    pub(crate) async fn check_live_meeting(&self, caller: &Caller, id: &str) -> ApiResult<String> {
+        let row = self.visible_meeting(caller, &docs::lowercase_uuid(id)).await?;
+        if row.deleted_at.is_some() {
+            return Err(ApiError::meeting_deleted());
+        }
+        if row.doc["status"] != "recording" {
+            return Err(ApiError::conflict("meeting_not_recording"));
+        }
+        Ok(row.id)
+    }
+
+    pub(crate) async fn meeting_deleted(&self, id: &str) -> bool {
+        matches!(self.store().meeting(id).await, Ok(Some(row)) if row.deleted_at.is_some())
+    }
+
+    /// Records which direct links are on offer (the Bluetooth and Wi-Fi Direct parts of the app call this).
+    pub fn set_direct_links(&self, links: DirectLinks) {
+        *self.inner.links.write().unwrap() = links;
+    }
+
+    pub(crate) fn add_direct_link(&self, link: &str) {
+        let mut links = self.inner.links.write().unwrap();
+        if !links.links.iter().any(|l| l == link) {
+            links.links.push(link.to_string());
+        }
+    }
+
+    pub fn direct_links(&self) -> DirectLinks {
+        self.inner.links.read().unwrap().clone()
+    }
+
+    /// `GET /v1/connections`.
+    pub fn connections(&self) -> Value {
+        let links = self.direct_links();
+        json!({
+            "links": links.links,
+            "wifiDirect": links.wifi_direct.map(|(name, pass)| json!({ "networkName": name, "passphrase": pass })),
         })
     }
 
@@ -548,6 +632,9 @@ impl Hub {
             self.fingerprint(),
             &self.reachable_addresses(),
         );
+        let links = self.direct_links();
+        let mut info = info;
+        info.qr_uri.push_str(&crate::pairing::link_params(&links.links, links.wifi_direct.as_ref()));
         *self.inner.pairing.lock().unwrap() = Some(session);
         info
     }

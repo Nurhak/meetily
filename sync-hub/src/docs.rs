@@ -130,10 +130,51 @@ pub fn set(doc: &mut Value, key: &str, value: Value) {
     }
 }
 
+/// A BCP 47 tag as the spec allows it: `nl`, `en-US`, `zh-Hans`, `sr-Latn-RS`, `es-419`
+/// (`^[a-z]{2,3}(-[A-Z][a-z]{3})?(-[A-Z]{2}|-[0-9]{3})?$`).
+pub fn is_language_code(code: &str) -> bool {
+    let mut parts = code.split('-');
+    let Some(lang) = parts.next() else { return false };
+    if !(2..=3).contains(&lang.len()) || !lang.bytes().all(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
+    let mut rest: Vec<&str> = parts.collect();
+    if rest.len() > 2 {
+        return false;
+    }
+    let is_script = |p: &str| {
+        p.len() == 4
+            && p.as_bytes()[0].is_ascii_uppercase()
+            && p.bytes().skip(1).all(|b| b.is_ascii_lowercase())
+    };
+    let is_region = |p: &str| {
+        (p.len() == 2 && p.bytes().all(|b| b.is_ascii_uppercase()))
+            || (p.len() == 3 && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if rest.first().is_some_and(|p| is_script(p)) {
+        rest.remove(0);
+    }
+    match rest.as_slice() {
+        [] => true,
+        [region] => is_region(region),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn language_codes() {
+        for ok in ["nl", "tr", "en-US", "zh-Hans", "sr-Latn-RS", "es-419", "fil"] {
+            assert!(is_language_code(ok), "{ok}");
+        }
+        for bad in ["", "NL", "en_US", "en-us", "english", "zh-hans", "en-US-x", "sr-RS-Latn", "e"] {
+            assert!(!is_language_code(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn equality_ignores_order_absent_vs_null_and_number_form() {

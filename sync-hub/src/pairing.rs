@@ -175,6 +175,20 @@ pub fn qr_uri(
     )
 }
 
+/// QR parameters for direct links (sync-protocol.md, "With the QR code"): `&l=p2p,bt` and, for Wi-Fi Direct,
+/// `&wd=<network name>&wp=<passphrase>`. Empty when nothing is on offer.
+pub fn link_params(links: &[String], wifi_direct: Option<&(String, String)>) -> String {
+    let mut out = String::new();
+    if !links.is_empty() {
+        let names: Vec<String> = links.iter().map(|l| percent_encode(l)).collect();
+        out.push_str(&format!("&l={}", names.join(",")));
+    }
+    if let Some((name, pass)) = wifi_direct {
+        out.push_str(&format!("&wd={}&wp={}", percent_encode(name), percent_encode(pass)));
+    }
+    out
+}
+
 fn percent_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -238,6 +252,16 @@ mod tests {
         }
         assert!(s.is_expired());
         assert!(matches!(s.attempt(phone, "7KQ2M9XD"), Attempt::Invalid));
+    }
+
+    #[test]
+    fn qr_link_parameters() {
+        assert_eq!(link_params(&[], None), "");
+        let wd = ("DIRECT-SC-7Q2M".to_string(), "pass word&1".to_string());
+        assert_eq!(
+            link_params(&["p2p".into(), "bt".into()], Some(&wd)),
+            "&l=p2p,bt&wd=DIRECT-SC-7Q2M&wp=pass%20word%261"
+        );
     }
 
     #[test]

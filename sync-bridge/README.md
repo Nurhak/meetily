@@ -11,6 +11,7 @@ Connects the [sync hub](../sync-hub/README.md) to Meetily's own meetings, so the
 | The hub wants a final transcript (phone meetings, "transcribe again" on a phone) | Meetily's retranscription makes it with the engine and model from Settings → Transcription. It waits while Meetily is recording, importing or retranscribing something else, and tries again a minute later. |
 | A title or transcript changes on one side | It goes to the other side. If both changed since the last sync, the desktop's version wins. Speakers on segments the user edited in Meetily are kept. |
 | A meeting is deleted in Meetily | It is deleted on the phones too, and kept in **Recently deleted** for 30 days. |
+| A phone records with live transcription | The phone streams its audio while recording and gets Meetily's transcript back as people talk (Silero speech detection, then Parakeet or Whisper as chosen in Settings → Transcription). Unavailable while Meetily records or transcribes another meeting; Meetily's transcription of phone meetings waits while live sessions run. |
 | A meeting is deleted on a phone | It is removed from Meetily. Restoring it (Settings → Phones → Recently deleted, or on a phone) brings it back everywhere. |
 
 Each meeting is reconciled on its own: both sides are compared with what was last synced (`bridge.db`, [`links.rs`](src/links.rs)), what changed is copied, and the new state is recorded. Hub events and a scan of Meetily's database every 10 seconds decide which meetings to look at. Meetily's code isn't changed for this; the bridge reads and writes the `meetings` and `transcripts` tables the way Meetily does.
@@ -29,13 +30,14 @@ Data lives in `<app data>/sync/` (`settings.json`, `bridge.db`, `hub/` with the 
 
 Tauri commands: `sync_status`, `sync_set_enabled { enabled }`, `sync_set_name { name }`, `sync_start_pairing`, `sync_cancel_pairing`, `sync_devices`, `sync_remove_device { deviceId }`, `sync_recently_deleted`, `sync_restore_meeting { meetingId }`, `sync_meetings_changed`.
 
-Events: `sync-meetings-changed` (the sidebar and an open meeting refresh), `sync-device-paired { deviceId }` (the pairing dialog closes).
+Events: `sync-meetings-changed` (the sidebar and an open meeting refresh), `sync-device-paired { deviceId }` (the pairing dialog closes), `sync-live-changed { sessions }` (Settings → Phones shows live sessions).
 
 macOS: `Info.plist` has `NSLocalNetworkUsageDescription` and `NSBonjourServices` (`_salescopilot._tcp`), so macOS asks for Local Network access the first time sync runs. Windows asks to allow the app through the firewall.
 
 ## Not done yet
 
 - Speaker detection: Meetily's retranscription has no diarization, so transcripts made here have no speakers.
+- Bluetooth LE and Wi-Fi Direct: the hub has the protocol layer; the GATT server and the Wi-Fi Direct group still need writing on each platform. A setting to turn live transcription off.
 - Meetily's summaries and notes don't sync (the meeting format has no field for them yet).
 - The bridge notices new recordings within 10 seconds; Meetily doesn't call `sync_meetings_changed` after saving a recording yet.
 

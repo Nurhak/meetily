@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event"
 import { toast } from "sonner"
-import { Smartphone, QrCode, Trash2, RotateCcw, AlertCircle, Loader2, Wifi } from "lucide-react"
+import { Smartphone, QrCode, Trash2, RotateCcw, AlertCircle, Loader2, Wifi, Radio } from "lucide-react"
 import { Switch } from "./ui/switch"
 import { Button } from "./ui/button"
 import { Input } from "./ui/input"
@@ -26,6 +26,8 @@ interface SyncStatus {
   port: number | null
   addresses: string[]
   pairedDevices: number
+  liveSessions: number
+  directLinks: string[]
   error: string | null
 }
 
@@ -139,6 +141,9 @@ export function PhoneSyncSettings() {
       }),
       listen("sync-meetings-changed", () => {
         loadLists()
+      }),
+      listen("sync-live-changed", () => {
+        loadStatus()
       }),
     ]
     return () => {
@@ -261,8 +266,9 @@ export function PhoneSyncSettings() {
             </div>
             <p className="text-sm text-gray-600">
               Pair phones with the Sales Copilot app. Meetings, transcripts and recordings sync between them and
-              this computer over your local network; nothing goes through the cloud. Meetings recorded on a phone
-              are transcribed here with your transcription model.
+              this computer directly, over your network or the phone&apos;s hotspot, or over peer-to-peer Wi-Fi between
+              an iPhone and a Mac; nothing goes through the cloud. Meetings recorded on a phone are transcribed here
+              with your transcription model, live while the phone records and again when the meeting ends.
             </p>
           </div>
           <div className="ml-6">
@@ -282,7 +288,18 @@ export function PhoneSyncSettings() {
             <Wifi className="h-4 w-4 flex-shrink-0 mt-0.5 text-green-600" />
             <span>
               Running on {status.addresses.length > 0 ? status.addresses.join(", ") : `port ${status.port}`}.
-              Phones need to be on the same network.
+              {status.directLinks.includes("p2p")
+                ? " iPhones and iPads also find this Mac over peer-to-peer Wi-Fi, without a shared network."
+                : " Phones need to be on the same network or the phone's hotspot."}
+            </span>
+          </div>
+        )}
+
+        {status.running && status.liveSessions > 0 && (
+          <div className="mt-2 flex items-start gap-2 text-sm text-gray-600">
+            <Radio className="h-4 w-4 flex-shrink-0 mt-0.5 text-red-600" />
+            <span>
+              Live transcription for {status.liveSessions === 1 ? "a phone" : `${status.liveSessions} phones`} now.
             </span>
           </div>
         )}

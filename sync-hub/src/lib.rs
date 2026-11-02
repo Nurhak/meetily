@@ -26,12 +26,14 @@
 //! ```
 
 pub mod api;
+pub mod bluetooth;
 mod discovery;
 pub mod docs;
 pub mod error;
 mod hub;
 pub mod identity;
 mod limits;
+pub mod live;
 pub mod netfilter;
 pub mod pairing;
 pub mod pinning;
@@ -47,8 +49,10 @@ use axum_server::tls_rustls::RustlsConfig;
 
 pub use hub::{
     audio_etag, meeting_etag, sha256_file, transcript_etag, AudioFile, Caller, FinishOutcome, Hub,
-    HubConfig, HubEvent, Precondition, TranscriptionTicket, Write, DEFAULT_PORT, PROTOCOL_VERSION,
+    DirectLinks, HubConfig, HubEvent, Precondition, TranscriptionTicket, Write, DEFAULT_PORT,
+    PROTOCOL_VERSION,
 };
+pub use live::{LiveError, LiveOpening, LiveReady, LiveSession, LiveStart, LiveText, LiveTranscriber};
 pub use pairing::PairingInfo;
 pub use store::DeviceRecord;
 
@@ -74,6 +78,27 @@ impl RunningHub {
     }
 }
 
+/// Lets the socket accept connections on Apple's peer-to-peer Wi-Fi interfaces (`SO_RECV_ANYIF`, which the
+/// public headers don't define), so iPhones reach the hub without a shared network.
+#[cfg(target_os = "macos")]
+fn accept_peer_to_peer(socket: &socket2::Socket) {
+    use std::os::fd::AsRawFd;
+    const SO_RECV_ANYIF: libc::c_int = 0x1104;
+    let on: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_RECV_ANYIF,
+            &on as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(target: "sync_hub", "SO_RECV_ANYIF: {}", std::io::Error::last_os_error());
+    }
+}
+
 fn bind(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
@@ -83,6 +108,8 @@ fn bind(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     }
     #[cfg(unix)]
     socket.set_reuse_address(true)?;
+    #[cfg(target_os = "macos")]
+    accept_peer_to_peer(&socket);
     socket.bind(&addr.into())?;
     socket.listen(128)?;
     socket.set_nonblocking(true)?;
@@ -177,6 +204,9 @@ impl Hub {
         } else {
             None
         };
+        if advertisement.as_ref().is_some_and(|a| a.peer_to_peer()) {
+            self.add_direct_link("p2p");
+        }
         tracing::info!(target: "sync_hub", "listening on {addresses:?}");
         Ok(RunningHub {
             addresses,
@@ -184,5 +214,32 @@ impl Hub {
             tasks,
             _advertisement: advertisement,
         })
+    }
+
+    /// Serves the API on one byte stream that isn't a TCP connection (a Bluetooth LE channel): TLS with the
+    /// hub's key, then HTTP/1.1 with upgrades (live transcription), exactly as on a TCP connection. Requests
+    /// appear to come from `peer`, which must pass the local-network check. Returns when the stream ends.
+    pub async fn serve_stream<S>(&self, io: S, peer: SocketAddr) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let deadline = self.config().handshake_timeout;
+        let acceptor = tokio_rustls::TlsAcceptor::from(self.identity().rustls_server_config()?);
+        let tls = tokio::time::timeout(deadline, acceptor.accept(io))
+            .await
+            .context("TLS handshake timed out")?
+            .context("TLS handshake")?;
+        let app = api::router(self.clone()).layer(axum::Extension(axum::extract::ConnectInfo(peer)));
+        hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(deadline)
+            .keep_alive(true)
+            .serve_connection(
+                hyper_util::rt::TokioIo::new(tls),
+                hyper_util::service::TowerToHyperService::new(app),
+            )
+            .with_upgrades()
+            .await
+            .context("serving the stream")
     }
 }

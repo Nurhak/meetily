@@ -6,6 +6,7 @@
 //! cargo run -p salescopilot-sync-hub --example fake_phone -- record --say "Hello, this is a test meeting."
 //! cargo run -p salescopilot-sync-hub --example fake_phone -- watch <meetingId>     # until the final transcript is in
 //! cargo run -p salescopilot-sync-hub --example fake_phone -- changes
+//! cargo run -p salescopilot-sync-hub --example fake_phone -- live --say "We should talk about the renewal."
 //! ```
 //!
 //! Pairing by code works like on a phone: the hub's key is taken on first use and the verification number is
@@ -43,6 +44,12 @@ commands:
   watch MEETING_ID [--timeout SECONDS]         wait until the hub has transcribed the meeting, then show the transcript
   show MEETING_ID                              show a meeting and its transcript
   changes [--since CURSOR]                     list the change feed
+  live [--wav FILE | --say TEXT] [--lang CODE] [--rate 16000|8000] [--speed X] [--no-upload]
+                                               record a meeting with live transcription: stream the audio in real
+                                               time (X times faster with --speed), print the computer's transcript
+                                               as it comes, then end the meeting and upload the recording so the
+                                               final transcript follows (watch it). --rate 8000 is what phones send
+                                               over Bluetooth.
   forget                                       delete the state file";
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -148,6 +155,15 @@ async fn main() -> Result<()> {
             let since = args.option("--since");
             changes(&State::load(&state_path)?.phone(), since.as_deref()).await
         }
+        "live" => {
+            let wav = args.option("--wav");
+            let say = args.option("--say");
+            let lang = args.option("--lang").unwrap_or_else(|| "en".into());
+            let rate: u32 = args.option("--rate").map(|r| r.parse()).transpose()?.unwrap_or(16000);
+            let speed: f64 = args.option("--speed").map(|r| r.parse()).transpose()?.unwrap_or(1.0);
+            let upload = !args.flag("--no-upload");
+            live(&State::load(&state_path)?, wav, say, &lang, rate, speed, upload).await
+        }
         "forget" => {
             std::fs::remove_file(&state_path).ok();
             println!("Removed {}", state_path.display());
@@ -212,26 +228,7 @@ async fn record(
 ) -> Result<()> {
     let phone = state.phone();
     let tmp = tempfile::tempdir()?;
-    let wav_path = match wav {
-        Some(p) => PathBuf::from(p),
-        None => {
-            let text = say.unwrap_or_else(|| {
-                "Hello, this is a test meeting from the fake phone. We talked about renewing the contract next month."
-                    .into()
-            });
-            let out = tmp.path().join("audio.wav");
-            let status = std::process::Command::new("say")
-                .args(["-o"])
-                .arg(&out)
-                .args(["--file-format=WAVE", "--data-format=LEI16@16000", &text])
-                .status()
-                .context("running `say` (macOS only; pass --wav FILE elsewhere)")?;
-            if !status.success() {
-                bail!("`say` failed: {status}");
-            }
-            out
-        }
-    };
+    let wav_path = wav_file(tmp.path(), wav, say)?;
     let audio =
         std::fs::read(&wav_path).with_context(|| format!("reading {}", wav_path.display()))?;
     let duration = BasicProber
@@ -292,6 +289,196 @@ async fn record(
     }
     println!("Recording uploaded ({} bytes)", audio.len());
     println!("\nWatch it: cargo run -p salescopilot-sync-hub --example fake_phone -- watch {id}");
+    Ok(())
+}
+
+/// The WAV to send: the given file, or one made with macOS `say` (16 kHz mono 16-bit).
+fn wav_file(dir: &Path, wav: Option<String>, say: Option<String>) -> Result<PathBuf> {
+    if let Some(p) = wav {
+        return Ok(PathBuf::from(p));
+    }
+    let text = say.unwrap_or_else(|| {
+        "Hello, this is a test meeting from the fake phone. We talked about renewing the contract next month.".into()
+    });
+    let out = dir.join("audio.wav");
+    let status = std::process::Command::new("say")
+        .args(["-o"])
+        .arg(&out)
+        .args(["--file-format=WAVE", "--data-format=LEI16@16000", &text])
+        .status()
+        .context("running `say` (macOS only; pass --wav FILE elsewhere)")?;
+    if !status.success() {
+        bail!("`say` failed: {status}");
+    }
+    Ok(out)
+}
+
+/// Sample rate and 16-bit mono PCM samples of a WAV file.
+fn wav_pcm(bytes: &[u8]) -> Result<(u32, Vec<i16>)> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        bail!("not a WAV file");
+    }
+    let (mut rate, mut channels, mut bits) = (0u32, 0u16, 0u16);
+    let mut at = 12;
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into()?) as usize;
+        let body = &bytes[at + 8..(at + 8 + size).min(bytes.len())];
+        if id == b"fmt " && body.len() >= 16 {
+            channels = u16::from_le_bytes([body[2], body[3]]);
+            rate = u32::from_le_bytes(body[4..8].try_into()?);
+            bits = u16::from_le_bytes([body[14], body[15]]);
+        } else if id == b"data" {
+            if channels != 1 || bits != 16 {
+                bail!("the WAV must be mono 16-bit (it is {channels} channel(s), {bits} bits)");
+            }
+            let samples = body.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+            return Ok((rate, samples));
+        }
+        at += 8 + size + (size & 1);
+    }
+    bail!("no audio data in the WAV file")
+}
+
+/// Records a meeting with live transcription (sync-protocol.md, "Live transcription").
+async fn live(
+    state: &State,
+    wav: Option<String>,
+    say: Option<String>,
+    lang: &str,
+    rate: u32,
+    speed: f64,
+    upload: bool,
+) -> Result<()> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let phone = state.phone();
+    let hello = reqwest_json(phone.client.get(format!("{}/v1/hello", state.base))).await?;
+    if !hello["features"].as_array().is_some_and(|f| f.iter().any(|x| x == "live-transcription")) {
+        bail!("this computer doesn't offer live transcription (hello: {hello})");
+    }
+    let tmp = tempfile::tempdir()?;
+    let wav_path = wav_file(tmp.path(), wav, say)?;
+    let audio = std::fs::read(&wav_path).with_context(|| format!("reading {}", wav_path.display()))?;
+    let (file_rate, samples) = wav_pcm(&audio)?;
+    // What a phone on Bluetooth sends: 8 kHz, here by dropping every other sample of a 16 kHz file.
+    let samples: Vec<i16> = if rate == file_rate {
+        samples
+    } else if rate * 2 == file_rate {
+        samples.iter().step_by(2).copied().collect()
+    } else {
+        bail!("--rate must be {file_rate} or {} for this file", file_rate / 2);
+    };
+    let duration = samples.len() as f64 / rate as f64;
+
+    // The meeting, recording.
+    let id = new_id();
+    let started = chrono::Utc::now();
+    let ts = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let title = format!("Fake phone live meeting {}", started.format("%H:%M:%S"));
+    let mut meeting = common::meeting_doc(&id, &state.device_id, "recording");
+    meeting["title"] = json!(title);
+    meeting["updatedAt"] = json!(ts(started));
+    meeting["startedAt"] = json!(ts(started));
+    meeting["languageCode"] = json!(lang);
+    meeting["recordedBy"]["deviceName"] = json!(state.name);
+    let reply = phone.create_meeting(&meeting).await;
+    if reply.status != StatusCode::CREATED {
+        bail!("creating the meeting failed: {} {}", reply.status, reply.body);
+    }
+    let etag = reply.etag();
+    println!("Meeting {id} \"{title}\" ({duration:.1} s of audio at {rate} Hz)");
+
+    // The WebSocket, over TLS pinned to the hub's key.
+    let authority = state.base.trim_start_matches("https://").to_string();
+    let tcp = tokio::net::TcpStream::connect(&authority).await.with_context(|| format!("connecting to {authority}"))?;
+    let mut config = sync_hub::pinning::PinnedKeyVerifier::client_config(state.fingerprint.clone());
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("hub")?, tcp)
+        .await?;
+    let mut request = format!("wss://{authority}/v1/meetings/{id}/live").into_client_request()?;
+    request.headers_mut().insert("authorization", format!("Bearer {}", state.token).parse()?);
+    request.headers_mut().insert("sec-websocket-protocol", sync_hub::live::SUBPROTOCOL.parse()?);
+    let (ws, _) = match tokio_tungstenite::client_async(request, tls).await {
+        Ok(ok) => ok,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            let body = response.body().as_ref().map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+            bail!("the computer refused live transcription: {} {body}", response.status());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let (mut sink, mut stream) = ws.split();
+    let start = json!({ "type": "start", "audio": { "format": "pcm_s16le", "sampleRate": rate, "channels": 1 }, "startSec": 0, "languageCode": lang });
+    sink.send(Message::Text(start.to_string().into())).await?;
+
+    // Audio in 100 ms frames at the speaking pace, while segments are printed as they arrive.
+    let frame = (rate / 10) as usize;
+    let pace = Duration::from_secs_f64(0.1 / speed.max(0.01));
+    let sender = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(pace);
+        for chunk in samples.chunks(frame) {
+            tick.tick().await;
+            let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
+            if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                return sink;
+            }
+        }
+        let _ = sink.send(Message::Text(json!({ "type": "stop" }).to_string().into())).await;
+        sink
+    });
+    let mut finals: Vec<(f64, String)> = Vec::new();
+    while let Some(msg) = stream.next().await {
+        let text = match msg? {
+            Message::Text(text) => text,
+            Message::Close(frame) => {
+                println!("(closed: {frame:?})");
+                break;
+            }
+            _ => continue,
+        };
+        let v: Value = serde_json::from_str(&text)?;
+        match v["type"].as_str() {
+            Some("ready") => println!("Live transcription by {} ({})\n", v["engine"], v["model"]),
+            Some("segment") => {
+                let (start, end) = (v["startSec"].as_f64().unwrap_or(0.0), v["endSec"].as_f64().unwrap_or(0.0));
+                let mark = if v["final"] == true { " " } else { "~" };
+                println!("{mark}[{start:6.1}–{end:6.1}] {}", v["text"].as_str().unwrap_or(""));
+                if v["final"] == true {
+                    finals.push((start, v["text"].as_str().unwrap_or("").to_string()));
+                }
+            }
+            Some("progress") => {}
+            Some("done") => {
+                println!("\nDone: {} segment(s)", finals.len());
+                break;
+            }
+            Some("error") => bail!("live transcription stopped: {} {}", v["code"], v["message"]),
+            _ => println!("{v}"),
+        }
+    }
+    drop(sender.await);
+
+    if !upload {
+        return Ok(());
+    }
+    // The meeting ends; the recording goes up and the computer makes the final transcript.
+    let ended = chrono::Utc::now();
+    meeting["status"] = json!("ended");
+    meeting["endedAt"] = json!(ts(ended));
+    meeting["updatedAt"] = json!(ts(ended));
+    let reply = phone.update_meeting(&meeting, &etag).await;
+    if !reply.status.is_success() {
+        bail!("ending the meeting failed: {} {}", reply.status, reply.body);
+    }
+    let reply = phone.upload(&id, "audio.wav", "audio/wav", &audio, 1 << 20).await;
+    if !reply.status.is_success() {
+        bail!("upload failed: {} {}", reply.status, reply.body);
+    }
+    println!("Meeting ended and recording uploaded. Final transcript:");
+    println!("  cargo run -p salescopilot-sync-hub --example fake_phone -- watch {id}");
     Ok(())
 }
 
