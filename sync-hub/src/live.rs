@@ -30,6 +30,12 @@ pub const MAX_AUDIO_FRAME: usize = 64 * 1024;
 pub const MAX_TEXT_FRAME: usize = 4 * 1024;
 
 const START_TIMEOUT: Duration = Duration::from_secs(15);
+/// Meeting times beyond this (about three years) are refused, so segment ids stay within 12 digits.
+const MAX_START_SEC: f64 = 1e8;
+/// After `stop`, the hub has this long to transcribe what is left (a slow engine with a full backlog).
+const FINISH_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_SEGMENT_TEXT: usize = 20_000;
+const MAX_ERROR_MESSAGE: usize = 1_000;
 /// Nothing at all from the phone (audio, messages or pings) for this long closes the session.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const PROGRESS_EVERY: Duration = Duration::from_secs(3);
@@ -99,21 +105,32 @@ pub trait LiveSession: Send + 'static {
     fn finish(&mut self) -> BoxFuture<'_, Result<Vec<LiveText>, LiveError>>;
 }
 
-/// Open sessions by device, so a new one replaces the old (`session_replaced`).
+/// Why the hub ends a session from outside it: an error code from the spec.
+type EndReason = Option<&'static str>;
+
+/// Open sessions by device, so a new one replaces the old (`session_replaced`) and removing a device ends its
+/// session (`device_revoked`).
 #[derive(Default)]
 pub struct Sessions {
     next: AtomicU64,
-    by_device: StdMutex<HashMap<String, (u64, watch::Sender<bool>)>>,
+    by_device: StdMutex<HashMap<String, (u64, watch::Sender<EndReason>)>>,
 }
 
 impl Sessions {
-    fn register(&self, device_id: &str) -> (u64, watch::Receiver<bool>) {
+    fn register(&self, device_id: &str) -> (u64, watch::Receiver<EndReason>) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = watch::channel(false);
+        let (tx, rx) = watch::channel(None);
         if let Some((_, old)) = self.by_device.lock().unwrap().insert(device_id.to_string(), (id, tx)) {
-            let _ = old.send(true);
+            let _ = old.send(Some("session_replaced"));
         }
         (id, rx)
+    }
+
+    /// Ends the device's session, if it has one (the device was removed, replaced or unpaired).
+    pub fn end_device(&self, device_id: &str) {
+        if let Some((_, tx)) = self.by_device.lock().unwrap().remove(device_id) {
+            let _ = tx.send(Some("device_revoked"));
+        }
     }
 
     fn unregister(&self, device_id: &str, id: u64) {
@@ -224,7 +241,7 @@ enum Problem {
 fn problem(code: &'static str, message: impl Into<String>) -> Problem {
     let close = match code {
         "transcriber_unavailable" | "too_far_behind" => 1013,
-        "session_replaced" => 1000,
+        "session_replaced" | "device_revoked" => 1000,
         _ => 1008,
     };
     Problem::Close { code, message: message.into(), close }
@@ -246,7 +263,7 @@ fn parse_start(text: &str) -> Result<Start, Problem> {
         .ok_or_else(|| problem("unsupported_audio_format", format!("sample rates: {SAMPLE_RATES:?}")))?;
     let start_sec = v["startSec"]
         .as_f64()
-        .filter(|s| s.is_finite() && *s >= 0.0)
+        .filter(|s| s.is_finite() && (0.0..=MAX_START_SEC).contains(s))
         .ok_or_else(|| problem("bad_request", "startSec must be a number of seconds"))?;
     let language = match &v["languageCode"] {
         Value::Null => None,
@@ -258,8 +275,8 @@ fn parse_start(text: &str) -> Result<Start, Problem> {
 
 /// Runs one session on an accepted WebSocket.
 pub async fn run(hub: Hub, transcriber: Arc<dyn LiveTranscriber>, device_id: String, meeting_id: String, mut socket: WebSocket) {
-    let (session_no, mut replaced) = hub.live_sessions().register(&device_id);
-    let result = session(&hub, transcriber, &device_id, &meeting_id, &mut socket, &mut replaced).await;
+    let (session_no, mut ended) = hub.live_sessions().register(&device_id);
+    let result = session(&hub, transcriber, &device_id, &meeting_id, &mut socket, &mut ended).await;
     hub.live_sessions().unregister(&device_id, session_no);
     match result {
         Ok(()) => {
@@ -267,6 +284,7 @@ pub async fn run(hub: Hub, transcriber: Arc<dyn LiveTranscriber>, device_id: Str
         }
         Err(Problem::Close { code, message, close }) => {
             tracing::info!(target: "sync_hub", "live session for {meeting_id} ended: {code} {message}");
+            let message: String = message.chars().take(MAX_ERROR_MESSAGE).collect();
             let _ = send_json(&mut socket, json!({ "type": "error", "code": code, "message": message })).await;
             let _ = socket.send(Message::Close(Some(CloseFrame { code: close, reason: Utf8Bytes::from(code) }))).await;
         }
@@ -294,7 +312,7 @@ async fn session(
     device_id: &str,
     meeting_id: &str,
     socket: &mut WebSocket,
-    replaced: &mut watch::Receiver<bool>,
+    ended: &mut watch::Receiver<EndReason>,
 ) -> Result<(), Problem> {
     // The start message.
     let start = loop {
@@ -380,6 +398,7 @@ async fn session(
     let mut resampler = Resampler::new(start.rate);
     let max_pending = MAX_BACKLOG.as_secs() * ENGINE_RATE as u64;
     let mut stopping = false;
+    let mut stopped_at: Option<Instant> = None;
     let mut last_input = Instant::now();
     let mut processed = start.start_sec;
     let mut reported = -1.0;
@@ -389,9 +408,12 @@ async fn session(
 
     loop {
         tokio::select! {
-            changed = replaced.changed() => {
-                if changed.is_ok() && *replaced.borrow() {
-                    return Err(problem("session_replaced", "a new session for this device started"));
+            changed = ended.changed() => {
+                let reason = *ended.borrow();
+                match (changed.is_ok(), reason) {
+                    (true, Some("session_replaced")) => return Err(problem("session_replaced", "a new session for this device started")),
+                    (true, Some(code)) => return Err(problem(code, "this device was removed on the computer")),
+                    _ => {}
                 }
             }
             worked = out_rx.recv() => {
@@ -402,7 +424,8 @@ async fn session(
                     None => return Err(problem("transcriber_unavailable", "the transcriber stopped")),
                 };
                 for t in texts {
-                    let text = t.text.trim();
+                    let text: String = t.text.trim().chars().take(MAX_SEGMENT_TEXT).collect();
+                    let text = text.as_str();
                     if text.is_empty() {
                         continue;
                     }
@@ -424,8 +447,13 @@ async fn session(
                 }
             }
             _ = progress.tick() => {
-                if last_input.elapsed() > IDLE_TIMEOUT {
-                    return Err(Problem::Gone);
+                // While finishing the phone sends nothing more; it has its own, longer deadline.
+                match stopped_at {
+                    Some(at) if at.elapsed() > FINISH_TIMEOUT => {
+                        return Err(problem("transcriber_unavailable", "transcribing the rest took too long"));
+                    }
+                    None if last_input.elapsed() > IDLE_TIMEOUT => return Err(Problem::Gone),
+                    _ => {}
                 }
                 if hub.meeting_deleted(meeting_id).await {
                     return Err(problem("meeting_deleted", "the meeting was deleted"));
@@ -472,6 +500,7 @@ async fn session(
                         match v["type"].as_str() {
                             Some("stop") => {
                                 stopping = true;
+                                stopped_at = Some(Instant::now());
                                 let tail = resampler.flush();
                                 if !tail.is_empty() {
                                     pending.fetch_add(tail.len() as u64, Ordering::Relaxed);

@@ -2,7 +2,7 @@
 
 The desktop app's side of the Sales Copilot **direct sync**: phones (iOS, Android) pair with the computer by QR code and sync meetings, transcripts and recordings with it directly (shared network, hotspot, peer-to-peer Wi-Fi or Bluetooth LE), with no cloud in between. While a phone records, it can also stream its audio and get the computer's transcript back live. The computer is the **hub**: it keeps every meeting, makes the final transcript with speaker detection, and sends it back to the phones.
 
-The protocol is specified in the [SalesMeetingCopilot](https://github.com/Nurhak/SalesMeetingCopilot) repository under `spec/`: `meeting-format.md`, `sync-protocol.md` and `sync-api.openapi.yaml`. The JSON Schemas are vendored in [`spec/schemas/`](spec/schemas/) (from SalesMeetingCopilot commit `949e6bf`); copy them again when the spec changes. Connections and live transcription follow the spec as of commit `8104da6`.
+The protocol is specified in the [SalesMeetingCopilot](https://github.com/Nurhak/SalesMeetingCopilot) repository under `spec/`: `meeting-format.md`, `sync-protocol.md` and `sync-api.openapi.yaml`. The JSON Schemas are vendored in [`spec/schemas/`](spec/schemas/) (from SalesMeetingCopilot commit `949e6bf`); copy them again when the spec changes. Connections and live transcription follow the spec as of commit `61aa4fb`.
 
 ## What it does
 

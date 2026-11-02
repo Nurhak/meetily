@@ -28,7 +28,7 @@ use crate::hub::{audio_etag, Caller, Hub, Precondition, Write, MAX_UPLOAD_CHUNK}
 use crate::live::{self, LiveError};
 
 const SMALL_BODY: usize = 64 * 1024;
-const LARGE_BODIES_AT_ONCE: usize = 4;
+pub(crate) const LARGE_BODIES_AT_ONCE: usize = 4;
 const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const TRANSCRIPT_BODY: usize = 20 * 1024 * 1024;
 const UPLOAD_OFFSET: HeaderName = HeaderName::from_static("upload-offset");
@@ -37,7 +37,7 @@ const UPLOAD_COMPLETE: HeaderName = HeaderName::from_static("upload-complete");
 pub fn router(hub: Hub) -> Router {
     let small = DefaultBodyLimit::max(SMALL_BODY);
     // Large bodies are buffered and parsed in memory: only a few at a time.
-    let large = GlobalConcurrencyLimitLayer::new(LARGE_BODIES_AT_ONCE);
+    let large = GlobalConcurrencyLimitLayer::with_semaphore(hub.large_bodies());
     Router::new()
         .route("/v1/hello", get(hello))
         .route("/v1/pair", post(pair).layer(small))

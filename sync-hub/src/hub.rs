@@ -389,6 +389,10 @@ struct Inner {
     listening: RwLock<Vec<SocketAddr>>,
     live: RwLock<Option<Arc<dyn LiveTranscriber>>>,
     live_sessions: live::Sessions,
+    /// Large request bodies held in memory at once, shared by every connection (TCP and Bluetooth channels).
+    large_bodies: Arc<tokio::sync::Semaphore>,
+    /// Bluetooth LE sessions open now.
+    bt_sessions: std::sync::atomic::AtomicUsize,
     /// Direct links on offer besides the shared network (`p2p`, `wd`, `bt`) and the Wi-Fi Direct group.
     links: RwLock<DirectLinks>,
 }
@@ -436,6 +440,8 @@ impl Hub {
                 listening: RwLock::new(Vec::new()),
                 live: RwLock::new(None),
                 live_sessions: live::Sessions::default(),
+                large_bodies: Arc::new(tokio::sync::Semaphore::new(crate::api::LARGE_BODIES_AT_ONCE)),
+                bt_sessions: std::sync::atomic::AtomicUsize::new(0),
                 links: RwLock::new(DirectLinks::default()),
             }),
         };
@@ -553,6 +559,23 @@ impl Hub {
         &self.inner.live_sessions
     }
 
+    pub(crate) fn large_bodies(&self) -> Arc<tokio::sync::Semaphore> {
+        self.inner.large_bodies.clone()
+    }
+
+    /// Counts a Bluetooth session; `false` when there are already `max` (the caller then refuses it).
+    pub(crate) fn bt_session_opened(&self, max: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        self.inner
+            .bt_sessions
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < max).then_some(n + 1))
+            .is_ok()
+    }
+
+    pub(crate) fn bt_session_closed(&self) {
+        self.inner.bt_sessions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Live sessions open now.
     pub fn live_session_count(&self) -> usize {
         self.inner.live_sessions.count()
@@ -561,6 +584,10 @@ impl Hub {
     /// The checks before a live session: the meeting exists for this caller, isn't deleted and is recording.
     pub(crate) async fn check_live_meeting(&self, caller: &Caller, id: &str) -> ApiResult<String> {
         let row = self.visible_meeting(caller, &docs::lowercase_uuid(id)).await?;
+        // Only the phone recording the meeting streams its audio (like uploads: meetings it recorded).
+        if !caller.owns(&row.recorded_by) {
+            return Err(ApiError::forbidden("only the device recording this meeting can transcribe it live"));
+        }
         if row.deleted_at.is_some() {
             return Err(ApiError::meeting_deleted());
         }
@@ -755,6 +782,7 @@ impl Hub {
     /// Removes a paired device ("Paired devices" in the app). Its token gets `device_revoked`.
     pub async fn remove_device(&self, device_id: &str) -> anyhow::Result<bool> {
         let _g = self.store().lock().await;
+        self.inner.live_sessions.end_device(device_id);
         self.store().remove_device(device_id, &docs::now()).await
     }
 
@@ -776,6 +804,7 @@ impl Hub {
                 all.extend(old_device.replaces);
             }
             all.push(old.clone());
+            self.inner.live_sessions.end_device(old);
             self.store().remove_device(old, &docs::now()).await?;
         }
         all.sort();

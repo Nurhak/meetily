@@ -274,6 +274,15 @@ impl<R: Runtime> LiveTranscriber for MeetilyLive<R> {
     }
 }
 
+/// Another handle on the same engine (the variants hold `Arc`s).
+fn same_engine(engine: &TranscriptionEngine) -> TranscriptionEngine {
+    match engine {
+        TranscriptionEngine::Whisper(w) => TranscriptionEngine::Whisper(w.clone()),
+        TranscriptionEngine::Parakeet(p) => TranscriptionEngine::Parakeet(p.clone()),
+        TranscriptionEngine::Provider(p) => TranscriptionEngine::Provider(p.clone()),
+    }
+}
+
 /// Silence that ends a speech segment; Meetily's own live path uses the same.
 const LIVE_REDEMPTION_MS: u32 = 500;
 
@@ -300,14 +309,34 @@ impl<R: Runtime> MeetilyLiveSession<R> {
             if segment.samples.len() < 16_000 / 4 {
                 continue;
             }
-            let text = match &self.engine {
-                TranscriptionEngine::Whisper(w) => w.transcribe_audio(segment.samples, self.language.clone()).await.map_err(|e| e.to_string()),
-                TranscriptionEngine::Parakeet(p) => p.transcribe_audio(segment.samples).await.map_err(|e| e.to_string()),
-                TranscriptionEngine::Provider(p) => p
-                    .transcribe(segment.samples, self.language.clone())
-                    .await
-                    .map(|r| r.text)
-                    .map_err(|e| e.to_string()),
+            // Meetily started recording or transcribing: the engine is its again.
+            if let Some(reason) = busy_reason() {
+                return Err(LiveError::Unavailable { retry_after_secs: 30, reason: reason.into() });
+            }
+            // The engines compute on the calling thread; keep that off the async threads the sync server uses.
+            let engine = same_engine(&self.engine);
+            let language = self.language.clone();
+            let handle = tokio::runtime::Handle::current();
+            let (start_ms, end_ms) = (segment.start_timestamp_ms, segment.end_timestamp_ms);
+            let samples = segment.samples;
+            let text = tokio::task::spawn_blocking(move || {
+                handle.block_on(async move {
+                    match &engine {
+                        TranscriptionEngine::Whisper(w) => w.transcribe_audio(samples, language).await.map_err(|e| e.to_string()),
+                        TranscriptionEngine::Parakeet(p) => p.transcribe_audio(samples).await.map_err(|e| e.to_string()),
+                        TranscriptionEngine::Provider(p) => {
+                            p.transcribe(samples, language).await.map(|r| r.text).map_err(|e| e.to_string())
+                        }
+                    }
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("transcription task: {e}")));
+            let segment = crate::audio::vad::SpeechSegment {
+                samples: Vec::new(),
+                start_timestamp_ms: start_ms,
+                end_timestamp_ms: end_ms,
+                confidence: 0.0,
             };
             match text {
                 Ok(text) => {

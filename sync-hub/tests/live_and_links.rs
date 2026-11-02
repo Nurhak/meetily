@@ -267,6 +267,9 @@ async fn live_sessions_are_refused_with_the_right_codes() {
     assert_eq!(refused(open_live(&hub, &phone, &new_id(), true).await), (404, "not_found".into()));
     let meeting = recording_meeting(&phone).await;
     assert_eq!(refused(open_live(&hub, &other, &meeting, true).await), (404, "not_found".into()));
+    // A phone that sees every meeting still can't stream audio into another phone's meeting.
+    let colleague = Phone::pair(&hub, "iPad", None).await;
+    assert_eq!(refused(open_live(&hub, &colleague, &meeting, true).await), (403, "forbidden".into()));
 
     // An ended meeting.
     let ended = new_id();
@@ -349,6 +352,21 @@ async fn a_new_session_from_the_same_phone_replaces_the_old_one() {
 }
 
 #[tokio::test]
+async fn removing_a_phone_on_the_computer_ends_its_session() {
+    let hub = start_hub().await;
+    hub.hub.set_live_transcriber(Some(Arc::new(Fake::default())));
+    let phone = Phone::pair(&hub, "iPhone", None).await;
+    let meeting = recording_meeting(&phone).await;
+    let mut ws = open_live(&hub, &phone, &meeting, true).await.unwrap();
+    send(&mut ws, start_msg(16000, 0.0)).await;
+    assert_eq!(next(&mut ws).await["type"], "ready");
+    assert!(hub.hub.remove_device(&phone.device_id).await.unwrap());
+    assert_eq!(next(&mut ws).await["code"], "device_revoked");
+    assert_eq!(next(&mut ws).await, json!({ "close": 1000 }));
+    assert_eq!(hub.hub.live_session_count(), 0);
+}
+
+#[tokio::test]
 async fn a_hub_that_falls_too_far_behind_ends_the_session() {
     let hub = start_hub().await;
     let fake = Fake { slow: Some(Duration::from_secs(3)), ..Fake::default() };
@@ -410,7 +428,7 @@ struct PhoneLink {
 
 /// Connects a [`BtSession`] to a phone-side link with the given ATT MTU; returns the link.
 fn connect(hub: &TestHub, mtu: usize) -> (PhoneLink, Arc<Mutex<Option<BtError>>>) {
-    let (mut session, mut notifications) = BtSession::new(hub.hub.clone(), "phone-1", mtu);
+    let (mut session, mut notifications) = BtSession::new(hub.hub.clone(), "phone-1", mtu).unwrap();
     let (writes, mut to_hub) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let error = Arc::new(Mutex::new(None));
     let err = error.clone();
@@ -523,6 +541,19 @@ async fn the_api_runs_over_bluetooth_channels() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut again = https_over(link.open(0, mtu), hub.hub.fingerprint()).await;
     assert_eq!(get_json(&mut again, "/v1/hello", None).await.0, 200);
+
+    // At most eight phones at once.
+    let more: Vec<_> = (0..7).map(|i| BtSession::new(hub.hub.clone(), &format!("phone-{}", i + 2), mtu)).collect();
+    assert!(more.iter().all(Result::is_ok));
+    assert_eq!(BtSession::new(hub.hub.clone(), "phone-10", mtu).err(), Some(BtError::TooManySessions));
+    drop(more);
+    assert!(BtSession::new(hub.hub.clone(), "phone-10", mtu).is_ok());
+
+    // A phone that sends far more than the hub reads is cut off (the hub reads nothing before the TLS hello).
+    let (mut flood, _rx) = BtSession::new(hub.hub.clone(), "flood", mtu).unwrap();
+    let junk = vec![3u8; 20];
+    let result = (0..20_000).map(|_| flood.received(&junk)).find(|r| r.is_err());
+    assert_eq!(result, Some(Err(BtError::Overloaded)));
 
     // A chunk for a channel that doesn't exist.
     link.writes.send(vec![7, 1, 2, 3]).unwrap();

@@ -29,6 +29,12 @@ pub const CHANNELS: usize = 4;
 /// Notifications waiting for the radio, per session; beyond this the hub's side of the stream waits.
 const NOTIFY_QUEUE: usize = 32;
 const STREAM_BUFFER: usize = 64 * 1024;
+/// Phone → hub bytes waiting for the hub to read them, per channel; a phone that sends more is disconnected.
+const MAX_QUEUED: usize = 256 * 1024;
+/// GATT allows attribute values of at most 512 bytes, whatever the MTU.
+const MAX_ATTRIBUTE: usize = 512;
+/// Phones connected over Bluetooth at once.
+pub const MAX_SESSIONS: usize = 8;
 
 /// The value of the `info` characteristic.
 pub fn info_value(hub_id: &str) -> Vec<u8> {
@@ -39,8 +45,17 @@ pub fn info_value(hub_id: &str) -> Vec<u8> {
 pub enum BtError {
     /// A chunk without a channel byte or for a channel above 3: disconnect the phone.
     BadChunk,
-    /// Data on a channel the phone closed and the hub hasn't finished closing.
+    /// Data on a channel the phone closed and the hub hasn't finished closing: disconnect the phone.
     ChannelClosing,
+    /// The phone sent more than the hub has read yet ([`MAX_QUEUED`]): disconnect the phone.
+    Overloaded,
+    /// Already [`MAX_SESSIONS`] phones on Bluetooth: refuse this one.
+    TooManySessions,
+}
+
+/// Largest payload for this ATT MTU.
+fn payload_for(att_mtu: usize) -> usize {
+    (att_mtu.max(23) - 3).min(MAX_ATTRIBUTE)
 }
 
 #[derive(Default)]
@@ -51,6 +66,8 @@ struct ChannelState {
 
 struct Channel {
     to_stream: mpsc::UnboundedSender<Option<Vec<u8>>>,
+    /// Bytes sent to `to_stream` and not yet written to the hub's side.
+    queued: Arc<AtomicUsize>,
     state: Arc<StdMutex<ChannelState>>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -76,7 +93,10 @@ pub struct BtSession {
 impl BtSession {
     /// `peer_key` identifies the phone as far as the platform can (e.g. the central's identifier), so limits per
     /// client address apply to it across reconnections. `att_mtu` is the negotiated ATT MTU (23 at least).
-    pub fn new(hub: Hub, peer_key: &str, att_mtu: usize) -> (Self, mpsc::Receiver<Vec<u8>>) {
+    pub fn new(hub: Hub, peer_key: &str, att_mtu: usize) -> Result<(Self, mpsc::Receiver<Vec<u8>>), BtError> {
+        if !hub.bt_session_opened(MAX_SESSIONS) {
+            return Err(BtError::TooManySessions);
+        }
         let (notify, notifications) = mpsc::channel(NOTIFY_QUEUE);
         let digest = Sha256::digest(peer_key.as_bytes());
         let mut peer = [0u8; 6];
@@ -84,16 +104,16 @@ impl BtSession {
         let session = Self {
             hub,
             peer,
-            max_payload: Arc::new(AtomicUsize::new(att_mtu.max(23) - 3)),
+            max_payload: Arc::new(AtomicUsize::new(payload_for(att_mtu))),
             notify,
             channels: Default::default(),
         };
-        (session, notifications)
+        Ok((session, notifications))
     }
 
     /// The MTU changed (some platforms report it after the subscription).
     pub fn set_mtu(&self, att_mtu: usize) {
-        self.max_payload.store(att_mtu.max(23) - 3, Ordering::Relaxed);
+        self.max_payload.store(payload_for(att_mtu), Ordering::Relaxed);
     }
 
     /// The address a channel's requests appear to come from: link-local, so it passes the local-network check,
@@ -146,6 +166,9 @@ impl BtSession {
         if c.state.lock().unwrap().phone_closed {
             return Err(BtError::ChannelClosing);
         }
+        if c.queued.fetch_add(data.len(), Ordering::SeqCst) + data.len() > MAX_QUEUED {
+            return Err(BtError::Overloaded);
+        }
         let _ = c.to_stream.send(Some(data.to_vec()));
         Ok(())
     }
@@ -162,11 +185,15 @@ impl BtSession {
             }
         });
         let (to_stream, mut from_phone) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let written = queued.clone();
         let write = tokio::spawn(async move {
             while let Some(item) = from_phone.recv().await {
                 match item {
                     Some(bytes) => {
-                        if link_write.write_all(&bytes).await.is_err() {
+                        let ok = link_write.write_all(&bytes).await.is_ok();
+                        written.fetch_sub(bytes.len(), Ordering::SeqCst);
+                        if !ok {
                             break;
                         }
                     }
@@ -190,8 +217,9 @@ impl BtSession {
                 chunk.push(channel);
                 chunk.extend_from_slice(&buf[..n]);
                 if n == 0 {
-                    read_state.lock().unwrap().hub_closed = true;
+                    // Queue the close before marking the channel finished, so a reopened channel can't overtake it.
                     let _ = notify.send(chunk).await;
+                    read_state.lock().unwrap().hub_closed = true;
                     return;
                 }
                 if notify.send(chunk).await.is_err() {
@@ -199,13 +227,27 @@ impl BtSession {
                 }
             }
         });
-        Channel { to_stream, state, tasks: vec![serve, write, read] }
+        Channel { to_stream, queued, state, tasks: vec![serve, write, read] }
+    }
+}
+
+impl Drop for BtSession {
+    fn drop(&mut self) {
+        self.hub.bt_session_closed();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_sizes() {
+        assert_eq!(payload_for(23), 20);
+        assert_eq!(payload_for(185), 182);
+        assert_eq!(payload_for(517), 512);
+        assert_eq!(payload_for(0), 20);
+    }
 
     #[test]
     fn info_and_addresses() {
